@@ -3828,6 +3828,8 @@ function trackWatch(v){v._m=W.m;v._ep=W.ep;v._s=0;v._d=0;
  W.timers.push(setInterval(chk,1000));wtTick(v._m,v._ep,()=>!v.paused&&!v.ended);v.addEventListener('pause',()=>{try{W.flush&&W.flush()}catch(e){}})}
 addEventListener('pagehide',()=>{try{wtCheck(W.video)}catch(e){}try{W.flush&&W.flush()}catch(e){}});
 (async()=>{if(!st0||!st0.t||st0.root)return;try{if(st0.p)openProfile(true);if(st0.o){await openAnime(st0.o,true);if(st0.w&&cur&&cur.id==st0.o)openWatch(true)}}catch(e){console.warn('[restore]',e)}})();
+</script>
+
 <script>
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
@@ -3842,4 +3844,5 @@ if ('serviceWorker' in navigator) {
     });
 }
 </script>
+   
 </body></html>
