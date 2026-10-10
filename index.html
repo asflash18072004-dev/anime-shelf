@@ -4863,4 +4863,19 @@ function playbackStateOf(){if(ACTIVE_PLAYBACK.providerId)return PLAYBACK_STATE.P
  if(W.plan&&W.plan.chain&&W.plan.pi<W.plan.chain.length)return PLAYBACK_STATE.CHECKING;
  if(W.ep&&Object.keys(W.failed||{}).length)return PLAYBACK_STATE.FAILED;
  return PLAYBACK_STATE.NOT_ATTEMPTED}
-</script></body></html>
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js', {
+            scope: './'
+        }).catch(err => {
+            console.warn(
+                'Anime Shelf service worker registration failed:',
+                err
+            );
+        });
+    });
+}
+</script>
+</body></html>
