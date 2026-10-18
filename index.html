@@ -1,5 +1,7 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
+<link rel="manifest" href="./manifest.webmanifest">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#121522">
 <meta name="color-scheme" content="dark">
@@ -7686,4 +7688,19 @@ function playbackStateOf(){if(ACTIVE_PLAYBACK.providerId)return PLAYBACK_STATE.P
  if(W.plan&&W.plan.chain&&W.plan.pi<W.plan.chain.length)return PLAYBACK_STATE.CHECKING;
  if(W.ep&&Object.keys(W.failed||{}).length)return PLAYBACK_STATE.FAILED;
  return PLAYBACK_STATE.NOT_ATTEMPTED}
-</script></body></html>
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js', {
+            scope: './'
+        }).catch(err => {
+            console.warn(
+                'Anime Shelf service worker registration failed:',
+                err
+            );
+        });
+    });
+}
+</script>
+</body></html>
