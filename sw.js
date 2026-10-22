@@ -1,4 +1,4 @@
-const CACHE_NAME = 'anime-shelf-shell-v9';
+const CACHE_NAME = 'anime-shelf-shell-v10';
 
 const APP_SHELL = [
     './',
