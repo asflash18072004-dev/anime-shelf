@@ -390,4 +390,43 @@ jobs:
                   customView = view;
                   customCb = cb;
                   view.setBackgroundColor(Color.BLACK);
-                  ((ViewGroup) getWindow().ge
+                              ((ViewGroup) getWindow().getDecorView()).addView(view,
+                    new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  WindowInsetsControllerCompat c = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+                  c.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                  c.hide(WindowInsetsCompat.Type.systemBars());
+                  setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+                  fsBack.setEnabled(true);
+                }
+
+                @Override
+                public void onHideCustomView() { exitCustom(); }
+              });
+            }
+
+            private void exitCustom() {
+              if (customView == null) return;
+              View v = customView;
+              WebChromeClient.CustomViewCallback cb = customCb;
+              customView = null;
+              customCb = null;
+              fsBack.setEnabled(false);
+              if (v.getParent() instanceof ViewGroup) ((ViewGroup) v.getParent()).removeView(v);
+              WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView()).show(WindowInsetsCompat.Type.systemBars());
+              setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+              if (cb != null) cb.onCustomViewHidden();
+            }
+          }
+          EOF
+      - run: npx cap sync android
+      - name: Build and sign
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -in release.keystore.enc -out release.keystore -pass env:KEY_PASS
+          cd android && ./gradlew assembleRelease && cd ..
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          $BT/zipalign -p -f 4 android/app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
+          $BT/apksigner sign --ks release.keystore --ks-pass env:KEY_PASS --ks-key-alias animeshelf --out AnimeShelf.apk aligned.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AnimeShelf-apk
+          path: AnimeShelf.apk
