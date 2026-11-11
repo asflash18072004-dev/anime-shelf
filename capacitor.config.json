@@ -1,0 +1,8 @@
+{
+  "appId": "com.asflash.animeshelf",
+  "appName": "Anime Shelf",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": true
+  }
+}
