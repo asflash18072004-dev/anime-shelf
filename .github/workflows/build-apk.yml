@@ -1,0 +1,874 @@
+name: Build APK
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      KEY_PASS: ${{ secrets.KEY_PASS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Make signing key (first run only)
+        run: |
+          if [ ! -f release.keystore.enc ]; then
+            keytool -genkeypair -keystore release.keystore -alias animeshelf -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=AnimeShelf" -storepass:env KEY_PASS -keypass:env KEY_PASS
+            openssl enc -aes-256-cbc -pbkdf2 -salt -in release.keystore -out release.keystore.enc -pass env:KEY_PASS
+            rm release.keystore
+            git config user.name github-actions
+            git config user.email actions@github.com
+            git add release.keystore.enc
+            git commit -m "Add signing key"
+            git push
+          fi
+      - name: Prepare web files
+        run: |
+          mkdir -p www
+          cp index.html native.js manifest.webmanifest www/
+          cp -r icons www/
+          sed -i -E 's/env\(safe-area-inset-(top|bottom), *0(px)?\)/var(--sa-\1,0px)/g' www/index.html
+          echo '<script src="native.js"></script>' >> www/index.html
+      - run: npm install
+      - run: npx cap add android
+      - name: App icon (from icon-192.png)
+        continue-on-error: true
+        run: |
+          pip install pillow -q
+          python3 - <<'PY'
+          import os
+          from PIL import Image
+          best = 'icons/icon-192.png'
+          if not os.path.exists(best):
+              print('icon-192.png not found, keeping default')
+              raise SystemExit(0)
+          print('Using icon:', best)
+          im = Image.open(best).convert('RGBA')
+          px = im.getpixel((3, 3))
+          bg = (13, 15, 25) if px[3] < 128 else px[:3]
+          hexc = '#%02X%02X%02X' % bg
+          print('Icon background:', hexc)
+          res = 'android/app/src/main/res'
+          dens = {'mdpi': (48, 108), 'hdpi': (72, 162), 'xhdpi': (96, 216), 'xxhdpi': (144, 324), 'xxxhdpi': (192, 432)}
+          for n, (l, f) in dens.items():
+              d = res + '/mipmap-' + n
+              os.makedirs(d, exist_ok=True)
+              ic = im.resize((l, l), Image.LANCZOS)
+              ic.save(d + '/ic_launcher.png')
+              ic.save(d + '/ic_launcher_round.png')
+              inner = int(f * 0.75)
+              fg = Image.new('RGBA', (f, f), (0, 0, 0, 0))
+              fg.paste(im.resize((inner, inner), Image.LANCZOS), ((f - inner) // 2, (f - inner) // 2))
+              fg.save(d + '/ic_launcher_foreground.png')
+          os.makedirs(res + '/values', exist_ok=True)
+          os.makedirs(res + '/mipmap-anydpi-v26', exist_ok=True)
+          open(res + '/values/ic_launcher_background.xml', 'w').write(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n <color name="ic_launcher_background">' + hexc + '</color>\n</resources>\n')
+          adaptive = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                      '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                      ' <background android:drawable="@color/ic_launcher_background"/>\n'
+                      ' <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+                      '</adaptive-icon>\n')
+          for x in ('ic_launcher', 'ic_launcher_round'):
+              open(res + '/mipmap-anydpi-v26/' + x + '.xml', 'w').write(adaptive)
+          print('icon done')
+          PY
+      - name: Manifest (local player server + background download service)
+        run: |
+          PKG=$(node -p "require('./capacitor.config.json').appId")
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q usesCleartextTraffic "$M" || sed -i 's/<application/<application android:usesCleartextTraffic="true"/' "$M"
+          if ! grep -q FOREGROUND_SERVICE_DATA_SYNC "$M"; then
+            sed -i 's#</manifest>#<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/><uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/><uses-permission android:name="android.permission.POST_NOTIFICATIONS"/><uses-permission android:name="android.permission.WAKE_LOCK"/></manifest>#' "$M"
+          fi
+          grep -q DownloadService "$M" || sed -i "s#</application>#<service android:name=\"$PKG.DownloadService\" android:exported=\"false\" android:foregroundServiceType=\"dataSync\"/></application>#" "$M"
+          cat "$M"
+      - name: Episode downloader (AnimeDL.java)
+        run: |
+          PKG=$(node -p "require('./capacitor.config.json').appId")
+          MAIN=$(find android/app/src/main/java -name MainActivity.java | head -1)
+          DIR=$(dirname "$MAIN")
+          echo "package $PKG;" > "$DIR/AnimeDL.java"
+          cat >> "$DIR/AnimeDL.java" <<'JEOF'
+
+          import android.content.Context;
+          import android.net.Uri;
+          import android.os.Environment;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.io.RandomAccessFile;
+          import java.net.HttpURLConnection;
+          import java.net.InetAddress;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.net.URL;
+          import java.nio.ByteBuffer;
+          import java.nio.channels.FileChannel;
+          import java.security.SecureRandom;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.concurrent.ConcurrentHashMap;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicInteger;
+          import java.util.concurrent.atomic.AtomicLong;
+          import java.util.concurrent.atomic.AtomicReference;
+
+          /* Episode downloader.
+             - downloads with several parallel connections (HTTP Range blocks) straight into one file, so it is
+               many times faster than Android's DownloadManager (which uses ONE connection); falls back to a
+               single stream when the server has no Range support
+             - serves the finished files to the WebView through a tiny local HTTP server (127.0.0.1) that
+               fully supports Range requests, so seeking in the player is instant and needs no internet */
+          public class AnimeDL {
+            private static final String SUBDIR = "ShelfAnime";
+            private static final int CONNS = 8;
+            private static final int BLOCK = 1024 * 1024;
+            private static final String UA_DEF = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
+            private static final ExecutorService POOL = Executors.newCachedThreadPool();
+
+            private static ServerSocket srv;
+            private static int port;
+            private static String token = "";
+
+            private final Context ctx;
+            private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
+
+            public AnimeDL(Context c) {
+              ctx = c.getApplicationContext();
+              startServer(ctx);
+            }
+
+            private static File dir(Context c) {
+              File base = c.getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+              File d = new File(base, SUBDIR);
+              if (!d.exists()) d.mkdirs();
+              return d;
+            }
+            private static String safe(String id) { return id == null ? "" : id.replaceAll("[^A-Za-z0-9_\\-]", "_"); }
+            private File finFile(String id) { return new File(dir(ctx), safe(id) + ".mp4"); }
+            private File partFile(String id) { return new File(dir(ctx), safe(id) + ".part"); }
+
+            @JavascriptInterface public boolean ok() { return true; }
+
+            /* e.g. http://127.0.0.1:41234/ab12cd... (empty string if the local server could not start) */
+            @JavascriptInterface
+            public String base() {
+              return (srv != null && port > 0) ? ("http://127.0.0.1:" + port + "/" + token) : "";
+            }
+
+            @JavascriptInterface
+            public long size(String id) {
+              try { File f = finFile(id); return f.exists() ? f.length() : 0L; } catch (Throwable t) { return 0L; }
+            }
+
+            @JavascriptInterface
+            public String start(String id, String url, String referer, String ua, String fileName) {
+              try {
+                cancelQuiet(id);
+                Job j = new Job(safe(id), url, referer, (ua != null && ua.length() > 0) ? ua : UA_DEF);
+                jobs.put(safe(id), j);
+                POOL.execute(j);
+                DownloadService.begin(ctx);
+                return "ok";
+              } catch (Throwable t) {
+                return "error: " + t;
+              }
+            }
+
+            @JavascriptInterface
+            public String status(String id) {
+              Job j = jobs.get(safe(id));
+              if (j == null) {
+                File f = finFile(id);
+                if (f.exists() && f.length() > 0) return "{\"st\":\"ok\",\"got\":" + f.length() + ",\"total\":" + f.length() + "}";
+                return "{\"st\":\"none\",\"got\":0,\"total\":0}";
+              }
+              return "{\"st\":\"" + j.st + "\",\"got\":" + j.got.get() + ",\"total\":" + j.total + "}";
+            }
+
+            @JavascriptInterface
+            public void cancel(String id) {
+              cancelQuiet(id);
+              svcCheck();
+            }
+
+            /* background service (keeps downloads alive when the app is not on screen) */
+            private void svcProgress() {
+              try {
+                int n = 0; long g = 0, t = 0;
+                for (Job j : jobs.values()) if ("run".equals(j.st) && !j.cancelled) { n++; g += j.got.get(); t += j.total; }
+                if (n > 0) DownloadService.progress(ctx, n, t > 0 ? (int) Math.min(100, g * 100 / t) : -1);
+              } catch (Throwable ignored) { }
+            }
+            private void svcCheck() {
+              try {
+                for (Job j : jobs.values()) if ("run".equals(j.st) && !j.cancelled) return;
+                DownloadService.end(ctx);
+              } catch (Throwable ignored) { }
+            }
+
+            private void cancelQuiet(String id) {
+              try {
+                Job j = jobs.remove(safe(id));
+                if (j != null) j.abort();
+              } catch (Throwable ignored) { }
+              try { File f = partFile(id); if (f.exists()) f.delete(); } catch (Throwable ignored) { }
+              try { File f = finFile(id); if (f.exists()) f.delete(); } catch (Throwable ignored) { }
+            }
+
+            @JavascriptInterface
+            public void remove(String id) { cancel(id); }
+
+            /* ================= parallel downloader ================= */
+            private class Job implements Runnable {
+              final String id, url, ref, ua;
+              volatile boolean cancelled = false;
+              volatile String st = "run";
+              volatile long total = 0;
+              final AtomicLong got = new AtomicLong(0);
+              volatile long lastNote = 0;
+              void note() { long n = System.currentTimeMillis(); if (n - lastNote < 1000) return; lastNote = n; svcProgress(); }
+              final Set<HttpURLConnection> conns = Collections.newSetFromMap(new ConcurrentHashMap<HttpURLConnection, Boolean>());
+
+              Job(String id, String url, String ref, String ua) { this.id = id; this.url = url; this.ref = ref; this.ua = ua; }
+
+              void abort() {
+                cancelled = true;
+                for (HttpURLConnection c : conns) { try { c.disconnect(); } catch (Throwable ignored) { } }
+              }
+
+              HttpURLConnection open(String u0, String range) throws IOException {
+                String u = u0;
+                for (int i = 0; i < 6; i++) {
+                  HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+                  c.setConnectTimeout(12000);
+                  c.setReadTimeout(20000);
+                  c.setInstanceFollowRedirects(false);
+                  c.setRequestProperty("User-Agent", ua);
+                  if (ref != null && ref.length() > 0) c.setRequestProperty("Referer", ref);
+                  c.setRequestProperty("Accept", "*/*");
+                  c.setRequestProperty("Accept-Encoding", "identity");
+                  if (range != null) c.setRequestProperty("Range", range);
+                  conns.add(c);
+                  if (cancelled) { conns.remove(c); c.disconnect(); throw new IOException("cancelled"); }
+                  int code = c.getResponseCode();
+                  if (code >= 300 && code < 400) {
+                    String loc = c.getHeaderField("Location");
+                    conns.remove(c);
+                    c.disconnect();
+                    if (loc == null) throw new IOException("redirect without Location");
+                    u = new URL(new URL(u), loc).toString();
+                    continue;
+                  }
+                  return c;
+                }
+                throw new IOException("too many redirects");
+              }
+
+              void drop(HttpURLConnection c) { if (c != null) { conns.remove(c); try { c.disconnect(); } catch (Throwable ignored) { } } }
+
+              public void run() {
+                File part = partFile(id), fin = finFile(id);
+                try {
+                  if (part.exists()) part.delete();
+                  if (fin.exists()) fin.delete();
+                  HttpURLConnection c = open(url, "bytes=0-0");
+                  int code = c.getResponseCode();
+                  String cr = c.getHeaderField("Content-Range");
+                  long cl = c.getContentLengthLong();
+                  String finalUrl = c.getURL().toString();
+                  long tot = -1;
+                  boolean ranged = false;
+                  if (code == 206 && cr != null) {
+                    int s = cr.lastIndexOf('/');
+                    if (s > 0) { try { tot = Long.parseLong(cr.substring(s + 1).trim()); ranged = tot > 0; } catch (Exception ignored) { } }
+                  } else if (code == 200) {
+                    tot = cl;
+                  } else {
+                    drop(c);
+                    throw new IOException("http " + code);
+                  }
+                  total = tot > 0 ? tot : 0;
+                  if (ranged && tot >= 2L * BLOCK) {
+                    drop(c);
+                    try {
+                      parallel(finalUrl, tot, part);
+                    } catch (Throwable e) {
+                      if (cancelled) return;
+                      got.set(0);                       /* parallel failed (server dislikes many connections?) -> one plain stream */
+                      if (part.exists()) part.delete();
+                      HttpURLConnection s1 = open(finalUrl, null);
+                      if (s1.getResponseCode() != 200) { int cc = s1.getResponseCode(); drop(s1); throw new IOException("http " + cc); }
+                      single(s1, part);
+                    }
+                  } else {
+                    HttpURLConnection s1 = c;
+                    if (code == 206) { drop(c); s1 = open(finalUrl, null); }
+                    if (s1.getResponseCode() != 200) { int cc = s1.getResponseCode(); drop(s1); throw new IOException("http " + cc); }
+                    single(s1, part);
+                  }
+                  if (cancelled) return;
+                  long len = part.length();
+                  if (total > 0 && got.get() != total) throw new IOException("incomplete " + got.get() + "/" + total);
+                  if (len <= 0) throw new IOException("empty file");
+                  if (fin.exists()) fin.delete();
+                  if (!part.renameTo(fin)) throw new IOException("rename failed");
+                  total = len;
+                  got.set(len);
+                  st = "ok";
+                  jobs.remove(id, this);
+                } catch (Throwable t) {
+                  if (!cancelled) st = "fail";
+                  try { if (part.exists()) part.delete(); } catch (Throwable ignored) { }
+                } finally {
+                  svcCheck();
+                }
+              }
+
+              void single(HttpURLConnection c, File part) throws IOException {
+                long cl = c.getContentLengthLong();
+                total = cl > 0 ? cl : 0;
+                got.set(0);
+                try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(part)) {
+                  byte[] b = new byte[64 * 1024];
+                  int r;
+                  while (!cancelled && (r = in.read(b)) > 0) { out.write(b, 0, r); got.addAndGet(r); note(); }
+                } finally { drop(c); }
+              }
+
+              void parallel(final String u, final long tot, File part) throws Throwable {
+                RandomAccessFile raf = new RandomAccessFile(part, "rw");
+                try {
+                  raf.setLength(tot);
+                  final FileChannel ch = raf.getChannel();
+                  final int nb = (int) ((tot + BLOCK - 1) / BLOCK);
+                  final AtomicInteger next = new AtomicInteger(0);
+                  final AtomicReference<Throwable> fail = new AtomicReference<>(null);
+                  int n = Math.min(CONNS, nb);
+                  Thread[] ts = new Thread[n];
+                  for (int i = 0; i < n; i++) {
+                    ts[i] = new Thread(new Runnable() {
+                      public void run() {
+                        byte[] buf = new byte[64 * 1024];
+                        while (!cancelled && fail.get() == null) {
+                          int b = next.getAndIncrement();
+                          if (b >= nb) break;
+                          long a = (long) b * BLOCK;
+                          long z = Math.min(tot - 1, a + BLOCK - 1);
+                          boolean ok = false;
+                          Throwable last = null;
+                          for (int t = 0; t < 4 && !ok && !cancelled; t++) {
+                            long pos = a;
+                            HttpURLConnection c = null;
+                            try {
+                              c = open(u, "bytes=" + a + "-" + z);
+                              if (c.getResponseCode() != 206) throw new IOException("range http " + c.getResponseCode());
+                              InputStream in = c.getInputStream();
+                              int r;
+                              while (pos <= z && (r = in.read(buf, 0, (int) Math.min(buf.length, z - pos + 1))) > 0) {
+                                ByteBuffer bb = ByteBuffer.wrap(buf, 0, r);
+                                long p = pos;
+                                while (bb.hasRemaining()) p += ch.write(bb, p);
+                                pos += r;
+                                got.addAndGet(r);
+                                note();
+                              }
+                              if (pos <= z) throw new IOException("short block");
+                              ok = true;
+                            } catch (Throwable e) {
+                              last = e;
+                              got.addAndGet(-(pos - a));
+                              try { Thread.sleep(400L * (t + 1)); } catch (InterruptedException ie) { return; }
+                            } finally {
+                              drop(c);
+                            }
+                          }
+                          if (!ok && !cancelled) fail.compareAndSet(null, last != null ? last : new IOException("block failed"));
+                        }
+                      }
+                    }, "animedl-" + id + "-" + i);
+                    ts[i].setDaemon(true);
+                    ts[i].start();
+                  }
+                  for (Thread t : ts) { try { t.join(); } catch (InterruptedException ie) { cancelled = true; } }
+                  if (fail.get() != null) throw fail.get();
+                } finally {
+                  try { raf.close(); } catch (Throwable ignored) { }
+                }
+              }
+            }
+                        /* ================= local file server (Range aware) ================= */
+            private static synchronized void startServer(final Context c) {
+              if (srv != null) return;
+              try {
+                srv = new ServerSocket(0, 32, InetAddress.getByName("127.0.0.1"));
+                port = srv.getLocalPort();
+                byte[] rb = new byte[12];
+                new SecureRandom().nextBytes(rb);
+                StringBuilder sb = new StringBuilder();
+                for (byte x : rb) sb.append(String.format("%02x", x));
+                token = sb.toString();
+                Thread t = new Thread(new Runnable() {
+                  public void run() {
+                    while (true) {
+                      try {
+                        final Socket s = srv.accept();
+                        POOL.execute(new Runnable() { public void run() { handle(c, s); } });
+                      } catch (IOException e) {
+                        if (srv == null || srv.isClosed()) break;
+                      }
+                    }
+                  }
+                }, "animedl-srv");
+                t.setDaemon(true);
+                t.start();
+              } catch (Throwable e) {
+                srv = null;
+                port = 0;
+              }
+            }
+
+            private static void status(OutputStream o, int code, String msg, String extra) throws IOException {
+              String h = "HTTP/1.1 " + code + " " + msg + "\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n" + (extra == null ? "" : extra) + "\r\n";
+              o.write(h.getBytes("ISO-8859-1"));
+              o.flush();
+            }
+
+            private static void handle(Context c, Socket s) {
+              try {
+                s.setSoTimeout(15000);
+                BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "ISO-8859-1"));
+                String line = r.readLine();
+                if (line == null) return;
+                String[] rl = line.split(" ");
+                String method = rl.length > 0 ? rl[0] : "";
+                String path = rl.length > 1 ? rl[1] : "";
+                String range = null, h;
+                while ((h = r.readLine()) != null && h.length() > 0) {
+                  if (h.regionMatches(true, 0, "range:", 0, 6)) range = h.substring(6).trim();
+                }
+                OutputStream o = s.getOutputStream();
+                int q = path.indexOf('?');
+                if (q >= 0) path = path.substring(0, q);
+                String pre = "/" + token + "/";
+                if (!path.startsWith(pre) || !(method.equals("GET") || method.equals("HEAD"))) { status(o, 404, "Not Found", null); return; }
+                String name = safe(path.substring(pre.length()).replaceAll("\\.mp4$", ""));
+                File f = new File(dir(c), name + ".mp4");
+                if (!f.exists()) { status(o, 404, "Not Found", null); return; }
+                long len = f.length(), start = 0, end = len - 1;
+                boolean partial = false;
+                if (range != null && range.startsWith("bytes=")) {
+                  String spec = range.substring(6).split(",")[0].trim();
+                  int d = spec.indexOf('-');
+                  try {
+                    String a = d > 0 ? spec.substring(0, d) : "";
+                    String b = d >= 0 ? spec.substring(d + 1) : "";
+                    if (a.length() > 0) {
+                      start = Long.parseLong(a);
+                      if (b.length() > 0) end = Long.parseLong(b);
+                    } else if (b.length() > 0) {
+                      start = Math.max(0, len - Long.parseLong(b));
+                    }
+                    partial = true;
+                  } catch (NumberFormatException ignored) { start = 0; end = len - 1; partial = false; }
+                  if (end >= len) end = len - 1;
+                  if (partial && start > end) { status(o, 416, "Range Not Satisfiable", "Content-Range: bytes */" + len + "\r\n"); return; }
+                }
+                long n = end - start + 1;
+                StringBuilder hd = new StringBuilder();
+                hd.append(partial ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n");
+                hd.append("Content-Type: video/mp4\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n");
+                hd.append("Content-Length: ").append(n).append("\r\n");
+                if (partial) hd.append("Content-Range: bytes ").append(start).append("-").append(end).append("/").append(len).append("\r\n");
+                hd.append("\r\n");
+                o.write(hd.toString().getBytes("ISO-8859-1"));
+                if (method.equals("GET")) {
+                  RandomAccessFile raf = new RandomAccessFile(f, "r");
+                  try {
+                    raf.seek(start);
+                    byte[] buf = new byte[64 * 1024];
+                    long left = n;
+                    while (left > 0) {
+                      int rd = raf.read(buf, 0, (int) Math.min(buf.length, left));
+                      if (rd <= 0) break;
+                      o.write(buf, 0, rd);
+                      left -= rd;
+                    }
+                  } finally { raf.close(); }
+                }
+                o.flush();
+              } catch (Throwable ignored) {
+              } finally {
+                try { s.close(); } catch (Throwable ignored) { }
+              }
+            }
+
+            /* kept for MainActivity (fallback path through WebView interception; the local server above is the main path) */
+            public static WebResourceResponse serve(Context c, WebResourceRequest req) {
+              try {
+                Uri u = req.getUrl();
+                String p = u.getPath();
+                if (p == null || !p.startsWith("/__dl/")) return null;
+                String name = safe(p.substring(6).replaceAll("\\.mp4$", ""));
+                File f = new File(dir(c), name + ".mp4");
+                Map<String, String> h = new HashMap<>();
+                h.put("Access-Control-Allow-Origin", "*");
+                h.put("Accept-Ranges", "bytes");
+                if (!f.exists()) return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", h, new java.io.ByteArrayInputStream(new byte[0]));
+                long len = f.length(), start = 0, end = len - 1;
+                String range = req.getRequestHeaders().get("Range");
+                if (range == null) range = req.getRequestHeaders().get("range");
+                boolean partial = false;
+                if (range != null && range.startsWith("bytes=")) {
+                  String[] a = range.substring(6).split("-", 2);
+                  try {
+                    if (a[0].length() > 0) start = Long.parseLong(a[0]);
+                    if (a.length > 1 && a[1].length() > 0) end = Long.parseLong(a[1]);
+                  } catch (NumberFormatException ignored) { }
+                  if (end >= len) end = len - 1;
+                  if (start > end) start = 0;
+                  partial = true;
+                }
+                long n = end - start + 1;
+                FileInputStream fis = new FileInputStream(f);
+                long skipped = 0;
+                while (skipped < start) { long sk = fis.skip(start - skipped); if (sk <= 0) break; skipped += sk; }
+                h.put("Content-Length", String.valueOf(n));
+                if (partial) {
+                  h.put("Content-Range", "bytes " + start + "-" + end + "/" + len);
+                  return new WebResourceResponse("video/mp4", null, 206, "Partial Content", h, new Limited(fis, n));
+                }
+                return new WebResourceResponse("video/mp4", null, 200, "OK", h, new Limited(fis, n));
+              } catch (Throwable t) {
+                return null;
+              }
+            }
+
+            private static class Limited extends InputStream {
+              private final InputStream in;
+              private long left;
+              Limited(InputStream in, long n) { this.in = in; this.left = n; }
+              @Override public int read() throws IOException { if (left <= 0) return -1; int b = in.read(); if (b >= 0) left--; return b; }
+              @Override public int read(byte[] b, int o, int l) throws IOException {
+                if (left <= 0) return -1;
+                int r = in.read(b, o, (int) Math.min(l, left));
+                if (r > 0) left -= r;
+                return r;
+              }
+              @Override public void close() throws IOException { in.close(); }
+            }
+          }
+          JEOF
+          echo "package $PKG;" > "$DIR/DownloadService.java"
+          cat >> "$DIR/DownloadService.java" <<'SEOF'
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+          import androidx.core.app.NotificationCompat;
+          import androidx.core.content.ContextCompat;
+
+          /* Foreground service: keeps the process (and the downloads inside it) alive while the app is in the background */
+          public class DownloadService extends Service {
+            static final String CH = "animedl";
+            static final int ID = 4711;
+            private static volatile boolean running = false;
+            private PowerManager.WakeLock wl;
+
+            static void channel(Context c) {
+              if (Build.VERSION.SDK_INT >= 26) {
+                NotificationManager m = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                if (m != null && m.getNotificationChannel(CH) == null) {
+                  m.createNotificationChannel(new NotificationChannel(CH, "Downloads", NotificationManager.IMPORTANCE_LOW));
+                }
+              }
+            }
+
+            static Notification build(Context c, int n, int pct) {
+              NotificationCompat.Builder b = new NotificationCompat.Builder(c, CH)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentTitle("Downloading episodes")
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW);
+              String what = n > 1 ? (n + " downloads") : "1 download";
+              if (pct >= 0) b.setContentText(what + " - " + pct + "%").setProgress(100, pct, false);
+              else b.setContentText(what).setProgress(0, 0, true);
+              Intent li = c.getPackageManager().getLaunchIntentForPackage(c.getPackageName());
+              if (li != null) b.setContentIntent(PendingIntent.getActivity(c, 0, li, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
+              return b.build();
+            }
+
+            public static void begin(Context c) {
+              try {
+                channel(c);
+                ContextCompat.startForegroundService(c, new Intent(c, DownloadService.class));
+              } catch (Throwable ignored) { }
+            }
+
+            public static void progress(Context c, int n, int pct) {
+              try {
+                if (!running) return;
+                NotificationManager m = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                if (m != null) m.notify(ID, build(c, n, pct));
+              } catch (Throwable ignored) { }
+            }
+
+            public static void end(Context c) {
+              try { c.stopService(new Intent(c, DownloadService.class)); } catch (Throwable ignored) { }
+            }
+
+            @Override
+            public int onStartCommand(Intent intent, int flags, int startId) {
+              channel(this);
+              Notification n = build(this, 1, -1);
+              try {
+                if (Build.VERSION.SDK_INT >= 29) startForeground(ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                else startForeground(ID, n);
+              } catch (Throwable t) {
+                stopSelf();
+                return START_NOT_STICKY;
+              }
+              running = true;
+              try {
+                if (wl == null) {
+                  PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                  wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "animeshelf:download");
+                  wl.acquire(6L * 60 * 60 * 1000);
+                }
+              } catch (Throwable ignored) { }
+              return START_NOT_STICKY;
+            }
+
+            @Override
+            public void onDestroy() {
+              running = false;
+              try { if (wl != null && wl.isHeld()) wl.release(); } catch (Throwable ignored) { }
+              wl = null;
+              try { stopForeground(true); } catch (Throwable ignored) { }
+              super.onDestroy();
+            }
+
+            @Override
+            public IBinder onBind(Intent intent) { return null; }
+          }
+          SEOF
+      - name: Native activity (edge-to-edge, real fullscreen + rotation)
+        run: |
+          PKG=$(node -p "require('./capacitor.config.json').appId")
+          MAIN=$(find android/app/src/main/java -name MainActivity.java | head -1)
+          echo "package $PKG;" > "$MAIN"
+          cat >> "$MAIN" <<'EOF'
+
+          import android.content.pm.ActivityInfo;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebView;
+          import android.widget.FrameLayout;
+          import androidx.activity.OnBackPressedCallback;
+          import androidx.core.graphics.Insets;
+          import androidx.core.view.ViewCompat;
+          import androidx.core.view.WindowCompat;
+          import androidx.core.view.WindowInsetsCompat;
+          import androidx.core.view.WindowInsetsControllerCompat;
+          import com.getcapacitor.BridgeActivity;
+          import com.getcapacitor.BridgeWebChromeClient;
+          import com.getcapacitor.BridgeWebViewClient;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.HashMap;
+          import java.util.Map;
+
+          public class MainActivity extends BridgeActivity {
+            private View customView;
+            private WebChromeClient.CustomViewCallback customCb;
+            private int saTop = 0, saBottom = 0;
+            private OnBackPressedCallback fsBack;
+
+            private WebResourceResponse agOpen(String target, String ref, String ua, String range) {
+              try {
+                if (target == null || !(target.startsWith("https://") || target.startsWith("http://"))) return null;
+                HttpURLConnection c = (HttpURLConnection) new URL(target).openConnection();
+                c.setConnectTimeout(8000);
+                c.setReadTimeout(25000);
+                c.setInstanceFollowRedirects(true);
+                c.setRequestProperty("User-Agent", (ua != null && ua.length() > 0) ? ua : "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36");
+                if (ref != null && ref.length() > 0) c.setRequestProperty("Referer", ref);
+                if (range != null && range.length() > 0) c.setRequestProperty("Range", range);
+                c.setRequestProperty("Accept", "*/*");
+                c.setRequestProperty("Accept-Encoding", "identity");
+                int code = c.getResponseCode();
+                if (code != 200 && code != 206) { c.disconnect(); return null; }
+                String ct = c.getContentType();
+                String mime = "video/mp4";
+                if (ct != null) { String m = ct.split(";")[0].trim(); if (m.startsWith("video/")) mime = m; }
+                Map<String, String> h = new HashMap<>();
+                String cl = c.getHeaderField("Content-Length");
+                if (cl != null) h.put("Content-Length", cl);
+                String cr = c.getHeaderField("Content-Range");
+                if (cr != null) h.put("Content-Range", cr);
+                h.put("Accept-Ranges", "bytes");
+                h.put("Access-Control-Allow-Origin", "*");
+                return new WebResourceResponse(mime, null, code, code == 206 ? "Partial Content" : "OK", h, c.getInputStream());
+              } catch (Exception e) {
+                return null;
+              }
+            }
+
+            private WebResourceResponse agProxy(WebResourceRequest rq) {
+              Uri u = rq.getUrl();
+              String range = null;
+              Map<String, String> rh = rq.getRequestHeaders();
+              if (rh != null) for (Map.Entry<String, String> e : rh.entrySet()) if ("range".equalsIgnoreCase(e.getKey())) range = e.getValue();
+              WebResourceResponse r = agOpen(u.getQueryParameter("u"), u.getQueryParameter("r"), u.getQueryParameter("ua"), range);
+              if (r == null) r = agOpen(u.getQueryParameter("fb"), null, null, range);
+              if (r == null) return new WebResourceResponse("text/plain", "utf-8", 502, "Bad Gateway", new HashMap<String, String>(), new java.io.ByteArrayInputStream(new byte[0]));
+              return r;
+            }
+
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1001);
+              }
+              final Window w = getWindow();
+              WindowCompat.setDecorFitsSystemWindows(w, false);
+              w.setStatusBarColor(Color.TRANSPARENT);
+              w.setNavigationBarColor(Color.TRANSPARENT);
+              if (Build.VERSION.SDK_INT >= 29) w.setNavigationBarContrastEnforced(false);
+              if (Build.VERSION.SDK_INT >= 28) {
+                WindowManager.LayoutParams lp = w.getAttributes();
+                lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                w.setAttributes(lp);
+              }
+              WindowInsetsControllerCompat ic = WindowCompat.getInsetsController(w, w.getDecorView());
+              ic.setAppearanceLightStatusBars(false);
+              ic.setAppearanceLightNavigationBars(false);
+
+              final WebView wv = getBridge().getWebView();
+              wv.addJavascriptInterface(new Object() {
+                @JavascriptInterface
+                public String get() { return saTop + "," + saBottom; }
+              }, "AnimeInsets");
+
+              getBridge().setWebViewClient(new BridgeWebViewClient(getBridge()) {
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                  try {
+                    Uri u = request.getUrl();
+                    if ("localhost".equals(u.getHost()) && "/__ag".equals(u.getPath())) return agProxy(request);
+                    if ("localhost".equals(u.getHost()) && u.getPath() != null && u.getPath().startsWith("/__dl/")) {
+                      WebResourceResponse dl = AnimeDL.serve(MainActivity.this, request);
+                      if (dl != null) return dl;
+                    }
+                  } catch (Exception e) { }
+                  return super.shouldInterceptRequest(view, request);
+                }
+              });
+              wv.addJavascriptInterface(new Object() {
+                @JavascriptInterface
+                public boolean ok() { return true; }
+              }, "AnimeProxy");
+              wv.addJavascriptInterface(new AnimeDL(this), "AnimeDL");
+
+              ViewCompat.setOnApplyWindowInsetsListener(w.getDecorView(), (v, insets) -> {
+                Insets b = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+                float d = getResources().getDisplayMetrics().density;
+                saTop = Math.round(b.top / d);
+                saBottom = Math.round(b.bottom / d);
+                final String js = "(function(){var s=document.documentElement.style;s.setProperty('--sa-top','" + saTop + "px');s.setProperty('--sa-bottom','" + saBottom + "px')})()";
+                wv.post(() -> wv.evaluateJavascript(js, null));
+                return ViewCompat.onApplyWindowInsets(v, insets);
+              });
+
+              fsBack = new OnBackPressedCallback(false) {
+                @Override
+                public void handleOnBackPressed() { exitCustom(); }
+              };
+              getOnBackPressedDispatcher().addCallback(this, fsBack);
+
+              wv.setWebChromeClient(new BridgeWebChromeClient(getBridge()) {
+                @Override
+                public void onShowCustomView(View view, WebChromeClient.CustomViewCallback cb) {
+                  if (customView != null) { cb.onCustomViewHidden(); return; }
+                  customView = view;
+                  customCb = cb;
+                  view.setBackgroundColor(Color.BLACK);
+                              ((ViewGroup) getWindow().getDecorView()).addView(view,
+                    new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  WindowInsetsControllerCompat c = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+                  c.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                  c.hide(WindowInsetsCompat.Type.systemBars());
+                  setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+                  fsBack.setEnabled(true);
+                }
+
+                @Override
+                public void onHideCustomView() { exitCustom(); }
+              });
+            }
+
+            private void exitCustom() {
+              if (customView == null) return;
+              View v = customView;
+              WebChromeClient.CustomViewCallback cb = customCb;
+              customView = null;
+              customCb = null;
+              fsBack.setEnabled(false);
+              if (v.getParent() instanceof ViewGroup) ((ViewGroup) v.getParent()).removeView(v);
+              WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView()).show(WindowInsetsCompat.Type.systemBars());
+              setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+              if (cb != null) cb.onCustomViewHidden();
+            }
+          }
+          EOF
+      - run: npx cap sync android
+      - name: Build and sign
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -in release.keystore.enc -out release.keystore -pass env:KEY_PASS
+          cd android && ./gradlew assembleRelease && cd ..
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          $BT/zipalign -p -f 4 android/app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
+          $BT/apksigner sign --ks release.keystore --ks-pass env:KEY_PASS --ks-key-alias animeshelf --out AnimeShelf.apk aligned.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AnimeShelf-apk
+          path: AnimeShelf.apk
