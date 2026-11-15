@@ -1,4 +1,4 @@
-const CACHE_NAME = 'anime-shelf-shell-v26';
+const CACHE_NAME = 'anime-shelf-shell-v27';
 
 const APP_SHELL = [
     './',
@@ -51,5 +51,49 @@ self.addEventListener('fetch', event => {
                 return response;
             })
             .catch(() => caches.match(request))
+    );
+});
+
+/* ===== Notifications ===== */
+
+// Web Push from the server: works even when the app is closed.
+// Expected payload (JSON): { title, body, aid, tag }
+self.addEventListener('push', event => {
+    let d = {};
+    try {
+        d = event.data ? event.data.json() : {};
+    } catch (e) {
+        try { d = { body: event.data.text() }; } catch (x) {}
+    }
+
+    event.waitUntil(
+        self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+            // The app is open and in front: it shows its own toast, so no phone notification.
+            if (list.some(c => c.visibilityState === 'visible' && c.focused)) return;
+            return self.registration.showNotification(d.title || 'Anime Shelf', {
+                body: d.body || '',
+                tag: d.tag || undefined,
+                icon: './icons/icon-192.png',
+                data: { aid: d.aid || 0 }
+            });
+        })
+    );
+});
+
+// Tapping a notification opens the app (and the anime, if it has one).
+self.addEventListener('notificationclick', event => {
+    event.notification.close();
+    const aid = (event.notification.data && event.notification.data.aid) || 0;
+
+    event.waitUntil(
+        self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+            for (const c of list) {
+                if ('focus' in c) {
+                    if (aid) c.postMessage({ type: 'nb-open', aid: aid });
+                    return c.focus();
+                }
+            }
+            return self.clients.openWindow(aid ? './?nbopen=' + aid : './');
+        })
     );
 });
