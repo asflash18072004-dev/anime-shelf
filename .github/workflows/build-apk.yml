@@ -37,7 +37,7 @@ jobs:
           sed -i -E 's/env\(safe-area-inset-(top|bottom), *0(px)?\)/var(--sa-\1,0px)/g' www/index.html
           echo '<script src="native.js"></script>' >> www/index.html
       - run: npm install
-      - name: Notification plugin
+            - name: Notification plugin
         run: |
           V=$(node -p "require('@capacitor/core/package.json').version.split('.')[0]")
           npm install @capacitor/local-notifications@$V
@@ -221,7 +221,8 @@ jobs:
                 int n = 0; long g = 0, t = 0;
                 for (Job j : jobs.values()) if ("run".equals(j.st) && !j.cancelled) { n++; g += j.got.get(); t += j.total; }
                 if (n > 0) DownloadService.progress(ctx, n, t > 0 ? (int) Math.min(100, g * 100 / t) : -1);
-              } catch (Throwable ignored) { }
+
+                              } catch (Throwable ignored) { }
             }
             private void svcCheck() {
               try {
@@ -444,7 +445,8 @@ jobs:
                   }
                 }, "animedl-srv");
                 t.setDaemon(true);
-                t.start();
+
+                                t.start();
               } catch (Throwable e) {
                 srv = null;
                 port = 0;
@@ -666,7 +668,8 @@ jobs:
                   PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                   wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "animeshelf:download");
                   wl.acquire(6L * 60 * 60 * 1000);
-                }
+
+                                  }
               } catch (Throwable ignored) { }
               return START_NOT_STICKY;
             }
