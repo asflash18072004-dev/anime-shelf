@@ -37,7 +37,7 @@ jobs:
           sed -i -E 's/env\(safe-area-inset-(top|bottom), *0(px)?\)/var(--sa-\1,0px)/g' www/index.html
           echo '<script src="native.js"></script>' >> www/index.html
       - run: npm install
-            - name: Notification plugin
+      - name: Notification plugin
         run: |
           V=$(node -p "require('@capacitor/core/package.json').version.split('.')[0]")
           npm install @capacitor/local-notifications@$V
