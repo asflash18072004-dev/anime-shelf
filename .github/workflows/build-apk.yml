@@ -226,7 +226,7 @@ jobs:
               } catch (Throwable ignored) { }
             }
 
-            private void cancelQuiet(String id) {
+                        private void cancelQuiet(String id) {
               try {
                 Job j = jobs.remove(safe(id));
                 if (j != null) j.abort();
@@ -447,7 +447,7 @@ jobs:
               }
             }
 
-            private static void status(OutputStream o, int code, String msg, String extra) throws IOException {
+                        private static void status(OutputStream o, int code, String msg, String extra) throws IOException {
               String h = "HTTP/1.1 " + code + " " + msg + "\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n" + (extra == null ? "" : extra) + "\r\n";
               o.write(h.getBytes("ISO-8859-1"));
               o.flush();
@@ -667,7 +667,7 @@ jobs:
               return START_NOT_STICKY;
             }
 
-            @Override
+                        @Override
             public void onDestroy() {
               running = false;
               try { if (wl != null && wl.isHeld()) wl.release(); } catch (Throwable ignored) { }
@@ -715,6 +715,7 @@ jobs:
           import java.net.URL;
           import java.util.HashMap;
           import java.util.Map;
+          import java.util.concurrent.ConcurrentHashMap;
 
           public class MainActivity extends BridgeActivity {
             private View customView;
@@ -722,11 +723,13 @@ jobs:
             private int saTop = 0, saBottom = 0;
             private OnBackPressedCallback fsBack;
 
-            private WebResourceResponse agOpen(String target, String ref, String ua, String range) {
+            private static final ConcurrentHashMap<String, Long> AG_BAD = new ConcurrentHashMap<>();
+
+            private WebResourceResponse agOpen(String target, String ref, String ua, String range, int connectMs) {
               try {
                 if (target == null || !(target.startsWith("https://") || target.startsWith("http://"))) return null;
                 HttpURLConnection c = (HttpURLConnection) new URL(target).openConnection();
-                c.setConnectTimeout(8000);
+                c.setConnectTimeout(connectMs);
                 c.setReadTimeout(25000);
                 c.setInstanceFollowRedirects(true);
                 c.setRequestProperty("User-Agent", (ua != null && ua.length() > 0) ? ua : "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36");
@@ -757,8 +760,17 @@ jobs:
               String range = null;
               Map<String, String> rh = rq.getRequestHeaders();
               if (rh != null) for (Map.Entry<String, String> e : rh.entrySet()) if ("range".equalsIgnoreCase(e.getKey())) range = e.getValue();
-              WebResourceResponse r = agOpen(u.getQueryParameter("u"), u.getQueryParameter("r"), u.getQueryParameter("ua"), range);
-              if (r == null) r = agOpen(u.getQueryParameter("fb"), null, null, range);
+              String tgt = u.getQueryParameter("u");
+              String host = "";
+              try { host = Uri.parse(tgt).getHost(); if (host == null) host = ""; } catch (Exception e) { }
+              Long bad = AG_BAD.get(host);
+              WebResourceResponse r = null;
+              /* direct route: short connect wait; if it fails, skip it for 2 minutes and go straight to the relay */
+              if (bad == null || System.currentTimeMillis() > bad) {
+                r = agOpen(tgt, u.getQueryParameter("r"), u.getQueryParameter("ua"), range, 3500);
+                if (r == null) AG_BAD.put(host, System.currentTimeMillis() + 120000L); else AG_BAD.remove(host);
+              }
+              if (r == null) r = agOpen(u.getQueryParameter("fb"), null, null, range, 8000);
               if (r == null) return new WebResourceResponse("text/plain", "utf-8", 502, "Bad Gateway", new HashMap<String, String>(), new java.io.ByteArrayInputStream(new byte[0]));
               return r;
             }
