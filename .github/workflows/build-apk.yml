@@ -1,0 +1,1667 @@
+name: Build APK
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      KEY_PASS: ${{ secrets.KEY_PASS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Make signing key (first run only)
+        run: |
+          if [ ! -f release.keystore.enc ]; then
+            keytool -genkeypair -keystore release.keystore -alias animeshelf -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=AnimeShelf" -storepass:env KEY_PASS -keypass:env KEY_PASS
+            openssl enc -aes-256-cbc -pbkdf2 -salt -in release.keystore -out release.keystore.enc -pass env:KEY_PASS
+            rm release.keystore
+            git config user.name github-actions
+            git config user.email actions@github.com
+            git add release.keystore.enc
+            git commit -m "Add signing key"
+            git push
+          fi
+      - name: Prepare web files
+        run: |
+          mkdir -p www
+          cp index.html native.js manifest.webmanifest www/
+          cp -r icons www/
+          sed -i -E 's/env\(safe-area-inset-(top|bottom), *0(px)?\)/var(--sa-\1,0px)/g' www/index.html
+          echo '<script src="native.js"></script>' >> www/index.html
+          if [ -f google-services.json ]; then sed -i 's/const NB_FCM=false/const NB_FCM=true/' www/index.html; echo "Firebase push: ON"; else echo "Firebase push: off (no google-services.json in the repo)"; fi
+      - run: npm install
+      - name: Notification plugin
+        run: |
+          V=$(node -p "require('@capacitor/core/package.json').version.split('.')[0]")
+          npm install @capacitor/local-notifications@$V
+          if [ -f google-services.json ]; then npm install @capacitor/push-notifications@$V; fi
+      - run: npx cap add android
+      - name: Firebase config (only if google-services.json exists)
+        run: |
+          if [ -f google-services.json ]; then cp google-services.json android/app/google-services.json; echo "google-services.json copied"; fi
+      - name: App icon (from icon-192.png)
+        continue-on-error: true
+        run: |
+          pip install pillow -q
+          python3 - <<'PY'
+          import os
+          from PIL import Image
+          best = 'icons/icon-192.png'
+          if not os.path.exists(best):
+              print('icon-192.png not found, keeping default')
+              raise SystemExit(0)
+          print('Using icon:', best)
+          im = Image.open(best).convert('RGBA')
+          px = im.getpixel((3, 3))
+          bg = (13, 15, 25) if px[3] < 128 else px[:3]
+          hexc = '#%02X%02X%02X' % bg
+          print('Icon background:', hexc)
+          res = 'android/app/src/main/res'
+          dens = {'mdpi': (48, 108), 'hdpi': (72, 162), 'xhdpi': (96, 216), 'xxhdpi': (144, 324), 'xxxhdpi': (192, 432)}
+          for n, (l, f) in dens.items():
+              d = res + '/mipmap-' + n
+              os.makedirs(d, exist_ok=True)
+              ic = im.resize((l, l), Image.LANCZOS)
+              ic.save(d + '/ic_launcher.png')
+              ic.save(d + '/ic_launcher_round.png')
+              inner = int(f * 0.75)
+              fg = Image.new('RGBA', (f, f), (0, 0, 0, 0))
+              fg.paste(im.resize((inner, inner), Image.LANCZOS), ((f - inner) // 2, (f - inner) // 2))
+              fg.save(d + '/ic_launcher_foreground.png')
+          os.makedirs(res + '/values', exist_ok=True)
+          os.makedirs(res + '/mipmap-anydpi-v26', exist_ok=True)
+          open(res + '/values/ic_launcher_background.xml', 'w').write(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n <color name="ic_launcher_background">' + hexc + '</color>\n</resources>\n')
+          adaptive = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                      '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                      ' <background android:drawable="@color/ic_launcher_background"/>\n'
+                      ' <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+                      '</adaptive-icon>\n')
+          for x in ('ic_launcher', 'ic_launcher_round'):
+              open(res + '/mipmap-anydpi-v26/' + x + '.xml', 'w').write(adaptive)
+          print('icon done')
+          PY
+      - name: Manifest (local player server + background download service)
+        run: |
+          PKG=$(node -p "require('./capacitor.config.json').appId")
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q usesCleartextTraffic "$M" || sed -i 's/<application/<application android:usesCleartextTraffic="true"/' "$M"
+          if ! grep -q FOREGROUND_SERVICE_DATA_SYNC "$M"; then
+            sed -i 's#</manifest>#<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/><uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/><uses-permission android:name="android.permission.POST_NOTIFICATIONS"/><uses-permission android:name="android.permission.WAKE_LOCK"/></manifest>#' "$M"
+          fi
+          grep -q DownloadService "$M" || sed -i "s#</application>#<service android:name=\"$PKG.DownloadService\" android:exported=\"false\" android:foregroundServiceType=\"dataSync\"/></application>#" "$M"
+          cat "$M"
+      - name: Episode downloader (AnimeDL.java)
+        run: |
+          PKG=$(node -p "require('./capacitor.config.json').appId")
+          MAIN=$(find android/app/src/main/java -name MainActivity.java | head -1)
+          DIR=$(dirname "$MAIN")
+          echo "package $PKG;" > "$DIR/AnimeDL.java"
+          cat >> "$DIR/AnimeDL.java" <<'JEOF'
+
+          import android.content.ContentResolver;
+          import android.content.Context;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.provider.DocumentsContract;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          import android.os.Environment;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.io.RandomAccessFile;
+          import java.net.HttpURLConnection;
+          import java.net.InetAddress;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.net.URL;
+          import java.nio.ByteBuffer;
+          import java.nio.channels.FileChannel;
+          import java.security.SecureRandom;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.concurrent.ConcurrentHashMap;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicInteger;
+          import java.util.concurrent.atomic.AtomicLong;
+          import java.util.concurrent.atomic.AtomicReference;
+
+          /* Episode downloader.
+             - downloads with several parallel connections (HTTP Range blocks) straight into one file, so it is
+               many times faster than Android's DownloadManager (which uses ONE connection); falls back to a
+               single stream when the server has no Range support
+             - serves the finished files to the WebView through a tiny local HTTP server (127.0.0.1) that
+               fully supports Range requests, so seeking in the player is instant and needs no internet */
+          public class AnimeDL {
+            private static final String SUBDIR = "ShelfAnime";
+            private static final int CONNS = 8;
+            private static final int BLOCK = 1024 * 1024;
+            private static final String UA_DEF = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
+            private static final ExecutorService POOL = Executors.newCachedThreadPool();
+
+            private static ServerSocket srv;
+            private static int port;
+            private static String token = "";
+
+            private final Context ctx;
+            private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
+
+            public AnimeDL(Context c) {
+              ctx = c.getApplicationContext();
+              appCtx = ctx;
+              startServer(ctx);
+            }
+
+            private static File dir(Context c) {
+              File base = c.getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+              File d = new File(base, SUBDIR);
+              if (!d.exists()) d.mkdirs();
+              return d;
+            }
+                        private static String safe(String id) { return id == null ? "" : id.replaceAll("[^A-Za-z0-9_\\-]", "_"); }
+            private File finFile(String id) { return new File(dir(ctx), safe(id) + ".mp4"); }
+            private File partFile(String id) { return new File(dir(ctx), safe(id) + ".part"); }
+
+            @JavascriptInterface public boolean ok() { return true; }
+
+            /* e.g. http://127.0.0.1:41234/ab12cd... (empty string if the local server could not start) */
+            @JavascriptInterface
+            public String base() {
+              return (srv != null && port > 0) ? ("http://127.0.0.1:" + port + "/" + token) : "";
+            }
+
+            @JavascriptInterface
+            public long size(String id) {
+              try { File f = finFile(id); return f.exists() ? f.length() : 0L; } catch (Throwable t) { return 0L; }
+            }
+
+            @JavascriptInterface
+            public String start(String id, String url, String referer, String ua, String fileName) {
+              try {
+                cancelQuiet(id);
+                Job j = new Job(safe(id), url, referer, (ua != null && ua.length() > 0) ? ua : UA_DEF);
+                j.label = (fileName != null) ? fileName : "";
+                jobs.put(safe(id), j);
+                                POOL.execute(j);
+                DownloadService.begin(ctx);
+                return "ok";
+              } catch (Throwable t) {
+                return "error: " + t;
+              }
+            }
+
+            @JavascriptInterface
+            public String status(String id) {
+              Job j = jobs.get(safe(id));
+              if (j == null) {
+                File f = finFile(id);
+                if (f.exists() && f.length() > 0) return "{\"st\":\"ok\",\"got\":" + f.length() + ",\"total\":" + f.length() + "}";
+                return "{\"st\":\"none\",\"got\":0,\"total\":0}";
+              }
+              return "{\"st\":\"" + j.st + "\",\"got\":" + j.got.get() + ",\"total\":" + j.total + "}";
+            }
+
+            @JavascriptInterface
+            public void cancel(String id) {
+              cancelQuiet(id);
+              svcCheck();
+            }
+
+            /* background service (keeps downloads alive when the app is not on screen) */
+            private void svcProgress() {
+              try {
+                int n = 0; long g = 0, t = 0;
+                for (Job j : jobs.values()) if ("run".equals(j.st) && !j.cancelled) { n++; g += j.got.get(); t += j.total; }
+                if (n > 0) DownloadService.progress(ctx, n, t > 0 ? (int) Math.min(100, g * 100 / t) : -1);
+              } catch (Throwable ignored) { }
+
+                          }
+            private void svcCheck() {
+              try {
+                for (Job j : jobs.values()) if ("run".equals(j.st) && !j.cancelled) return;
+                DownloadService.end(ctx);
+              } catch (Throwable ignored) { }
+            }
+
+                        private void cancelQuiet(String id) {
+              try {
+                Job j = jobs.remove(safe(id));
+                if (j != null) j.abort();
+              } catch (Throwable ignored) { }
+              try { File f = partFile(id); if (f.exists()) f.delete(); } catch (Throwable ignored) { }
+              try { File f = finFile(id); if (f.exists()) f.delete(); } catch (Throwable ignored) { }
+            }
+
+            @JavascriptInterface
+            public void remove(String id) { cancel(id); }
+                        /* ================= export / import to a folder the user picks (survives uninstall) ================= */
+            public interface Picker { void pick(String mode); }
+            public static volatile Picker picker;
+            private static volatile Context appCtx;
+            private static final String XF_FOLDER = "AnimeShelf Downloads";
+            private static final String XF_MANIFEST = "animeshelf-downloads.json";
+            private static final Pattern XF_ID1 = Pattern.compile("\\[([A-Za-z0-9_\\-]+)\\]\\.mp4$");
+            private static final Pattern XF_ID2 = Pattern.compile("^([A-Za-z0-9_\\-]+)\\.mp4$");
+            private static volatile String xSt = "idle", xMode = "", xCur = "", xErr = "", xPayload = "", xManifest = "";
+            private static volatile int xFiles = 0, xDone = 0, xSkip = 0, xBad = 0;
+            private static volatile long xTotal = 0;
+            private static final AtomicLong xGot = new AtomicLong(0);
+            private static volatile boolean xCancel = false;
+            private static volatile List<String[]> xItems = null;   /* import: {docId, displayName, safeId, size} */
+            private static volatile Uri xTree = null;
+            private static volatile String xManId = null;
+
+            /* mode = "export" | "import"; payload = JSON the page wants stored next to the videos (export only) */
+            @JavascriptInterface
+            public String pickFolder(String mode, String payload) {
+              if ("run".equals(xSt)) return "busy";
+              Picker p = picker;
+              if (p == null) return "unsupported";
+              xMode = "import".equals(mode) ? "import" : "export";
+              xPayload = payload == null ? "" : payload;
+              xManifest = ""; xErr = ""; xCur = ""; xFiles = 0; xDone = 0; xSkip = 0; xBad = 0; xTotal = 0; xGot.set(0); xCancel = false;
+              xSt = "pick";
+              try { p.pick(xMode); return "ok"; } catch (Throwable t) { xSt = "fail"; xErr = String.valueOf(t); return "error"; }
+            }
+
+            @JavascriptInterface
+            public String xferStatus() {
+              try {
+                JSONObject o = new JSONObject();
+                o.put("st", xSt); o.put("mode", xMode); o.put("cur", xCur); o.put("err", xErr);
+                o.put("files", xFiles); o.put("done", xDone); o.put("skip", xSkip); o.put("bad", xBad);
+                o.put("got", xGot.get()); o.put("total", xTotal);
+                if ("ok".equals(xSt)) o.put("manifest", xManifest);
+              if ("list".equals(xSt)) {
+                JSONArray a = new JSONArray();
+                List<String[]> it = xItems;
+                if (it != null) for (String[] k : it) {
+                  JSONObject j = new JSONObject();
+                  j.put("id", k[2]); j.put("name", k[1]); j.put("size", Long.parseLong(k[3]));
+                  a.put(j);
+                }
+                o.put("items", a);
+                o.put("manifest", xManifest);
+              }
+                return o.toString();
+              } catch (Throwable t) { return "{\"st\":\"idle\"}"; }
+            }
+
+            @JavascriptInterface
+            public void xferCancel() { xCancel = true; }
+
+            /* import step 2: the user ticked some of the listed videos; ids = JSON array of the safe ids */
+            @JavascriptInterface
+            public String importSelected(String idsJson) {
+              if (!"list".equals(xSt) || xItems == null || xTree == null) return "bad";
+              final List<String[]> sel = new ArrayList<>();
+                            long t = 0;
+              try {
+                JSONArray a = new JSONArray(idsJson);
+                java.util.HashSet<String> want = new java.util.HashSet<>();
+                for (int i = 0; i < a.length(); i++) want.add(a.getString(i));
+                for (String[] k : xItems) if (want.contains(k[2])) { sel.add(k); t += Long.parseLong(k[3]); }
+              } catch (Throwable e) { return "bad"; }
+              if (sel.isEmpty()) return "empty";
+              xDone = 0; xBad = 0; xGot.set(0); xCancel = false; xCur = ""; xErr = "";
+              xFiles = sel.size(); xTotal = t;
+              xSt = "run";
+              POOL.execute(new Runnable() {
+                public void run() {
+                  try {
+                    doImportRun(sel);
+                    xSt = xCancel ? "cancel" : "ok";
+                  } catch (Throwable e) {
+                    xSt = "fail"; xErr = String.valueOf(e.getMessage() != null ? e.getMessage() : e);
+                  }
+                }
+              });
+              return "ok";
+            }
+
+            @JavascriptInterface
+            public void importCancel() {
+              if ("list".equals(xSt) || "scan".equals(xSt)) { xCancel = true; xSt = "idle"; xItems = null; }
+            }
+
+            /* called by MainActivity with the folder the user picked (null = picker dismissed) */
+            public static void onPicked(final Uri tree) {
+              if (tree == null) { xSt = "idle"; return; }
+              if (appCtx == null) { xSt = "fail"; xErr = "not ready"; return; }
+              final boolean exp = !"import".equals(xMode);
+              xSt = exp ? "run" : "scan";
+              POOL.execute(new Runnable() {
+                public void run() {
+                  try {
+                    if (exp) { doExport(tree); xSt = xCancel ? "cancel" : "ok"; }
+                    else { doScan(tree); xSt = "list"; }
+                  } catch (Throwable t) {
+                    xSt = "fail"; xErr = String.valueOf(t.getMessage() != null ? t.getMessage() : t);
+                  }
+                }
+              });
+            }
+                        private static String xfId(String name) {
+              if (name == null) return null;
+              Matcher m = XF_ID1.matcher(name);
+              if (m.find()) return m.group(1);
+              m = XF_ID2.matcher(name);
+              if (m.find()) return m.group(1);
+              return null;
+            }
+
+            private static List<String[]> xfKids(ContentResolver cr, Uri tree, String parentDocId) {
+              List<String[]> out = new ArrayList<>();
+              Uri q = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentDocId);
+              Cursor c = null;
+              try {
+                c = cr.query(q, new String[]{DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME, DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_SIZE}, null, null, null);
+                while (c != null && c.moveToNext()) {
+                  long sz = c.isNull(3) ? 0L : c.getLong(3);
+                  out.add(new String[]{c.getString(0), c.getString(1), c.getString(2), String.valueOf(sz)});
+                }
+              } finally { if (c != null) c.close(); }
+              return out;
+            }
+
+            private static boolean xfIsDir(String[] k) { return DocumentsContract.Document.MIME_TYPE_DIR.equals(k[2]); }
+
+            private static void doExport(Uri tree) throws Exception {
+              Context c = appCtx;
+              ContentResolver cr = c.getContentResolver();
+              String rootId = DocumentsContract.getTreeDocumentId(tree);
+              Uri root = DocumentsContract.buildDocumentUriUsingTree(tree, rootId);
+              String subId = null;
+              for (String[] k : xfKids(cr, tree, rootId)) if (xfIsDir(k) && XF_FOLDER.equals(k[1])) { subId = k[0]; break; }
+              Uri sub;
+              if (subId == null) {
+                sub = DocumentsContract.createDocument(cr, root, DocumentsContract.Document.MIME_TYPE_DIR, XF_FOLDER);
+                if (sub == null) throw new IOException("could not create folder");
+                subId = DocumentsContract.getDocumentId(sub);
+              } else {
+                sub = DocumentsContract.buildDocumentUriUsingTree(tree, subId);
+              }
+              JSONObject names = new JSONObject();
+              try { names = new JSONObject(xPayload).optJSONObject("names"); if (names == null) names = new JSONObject(); } catch (Throwable ignored) { names = new JSONObject(); }
+              List<String[]> have = xfKids(cr, tree, subId);
+              File[] fs = dir(c).listFiles();
+              List<File> todo = new ArrayList<>();
+              List<String> todoName = new ArrayList<>();
+              long total = 0;
+              if (fs != null) {
+                for (File f : fs) {
+                  String n = f.getName();
+                                    if (!n.endsWith(".mp4") || f.length() <= 0) continue;
+                  String id = n.substring(0, n.length() - 4);
+                  String fr = names.optString(id, "");
+                  String out = (fr.length() > 0 ? fr + " [" + id + "]" : id) + ".mp4";
+                  boolean same = false;
+                  for (String[] k : have) {
+                    if (xfIsDir(k) || !id.equals(xfId(k[1]))) continue;
+                    if (Long.parseLong(k[3]) == f.length()) same = true;
+                    else { try { DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, k[0])); } catch (Throwable ignored) { } }
+                  }
+                  if (same) { xSkip++; continue; }
+                  todo.add(f); todoName.add(out); total += f.length();
+                }
+              }
+              xFiles = todo.size(); xTotal = total;
+              byte[] buf = new byte[256 * 1024];
+                            for (int i = 0; i < todo.size() && !xCancel; i++) {
+                File f = todo.get(i);
+                xCur = todoName.get(i);
+                Uri dst = DocumentsContract.createDocument(cr, sub, "video/mp4", todoName.get(i));
+                if (dst == null) { xBad++; continue; }
+                boolean ok = false;
+                InputStream in = null; OutputStream out = null;
+                try {
+                  in = new FileInputStream(f);
+                  out = cr.openOutputStream(dst);
+                  if (out == null) throw new IOException("cannot write");
+                  int r;
+                  while (!xCancel && (r = in.read(buf)) > 0) { out.write(buf, 0, r); xGot.addAndGet(r); }
+                  out.flush();
+                  ok = !xCancel;
+                } catch (Throwable t) {
+                  xBad++;
+                } finally {
+                  try { if (in != null) in.close(); } catch (Throwable ignored) { }
+                  try { if (out != null) out.close(); } catch (Throwable ignored) { }
+                  if (!ok) { try { DocumentsContract.deleteDocument(cr, dst); } catch (Throwable ignored) { } }
+                }
+                if (ok) xDone++;
+              }
+              if (xCancel) return;
+              /* the list of what these files are (title, episode, ...), so the app can rebuild its Downloads list without the cloud */
+              if (xPayload.length() > 0) {
+                for (String[] k : xfKids(cr, tree, subId)) {
+                  if (XF_MANIFEST.equals(k[1])) { try { DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, k[0])); } catch (Throwable ignored) { } }
+                }
+                Uri m = DocumentsContract.createDocument(cr, sub, "application/json", XF_MANIFEST);
+                if (m != null) {
+                  OutputStream mo = cr.openOutputStream(m);
+                  try { if (mo != null) mo.write(xPayload.getBytes("UTF-8")); } finally { if (mo != null) mo.close(); }
+                }
+              }
+            }
+
+            /* import step 1: look into the folder and list what can be imported (nothing is copied yet) */
+            private static void doScan(Uri tree) throws Exception {
+              Context c = appCtx;
+              ContentResolver cr = c.getContentResolver();
+              String rootId = DocumentsContract.getTreeDocumentId(tree);
+              String srcId = rootId;
+              for (String[] k : xfKids(cr, tree, rootId)) if (xfIsDir(k) && XF_FOLDER.equals(k[1])) { srcId = k[0]; break; }
+              List<String[]> items = new ArrayList<>();
+              long total = 0;
+              File d = dir(c);
+              xManId = null;
+              for (String[] k : xfKids(cr, tree, srcId)) {
+                if (xfIsDir(k)) continue;
+                if (XF_MANIFEST.equals(k[1])) {
+                  xManId = k[0];
+                  InputStream mi = cr.openInputStream(DocumentsContract.buildDocumentUriUsingTree(tree, k[0]));
+                  try {
+                    java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                    byte[] b = new byte[16384]; int r; long n = 0;
+                    while (mi != null && (r = mi.read(b)) > 0 && n < 8L * 1024 * 1024) { bo.write(b, 0, r); n += r; }
+                    xManifest = bo.toString("UTF-8");
+                  } finally { if (mi != null) mi.close(); }
+                  continue;
+                }
+                String id = xfId(k[1]);
+                if (id == null || !k[1].endsWith(".mp4")) continue;
+                long sz = Long.parseLong(k[3]);
+                File ex = new File(d, safe(id) + ".mp4");
+                if (ex.exists() && ex.length() == sz && sz > 0) { xSkip++; continue; }
+                items.add(new String[]{k[0], k[1], safe(id), k[3]});
+                total += sz;
+              }
+              xTree = tree; xItems = items;
+              xFiles = items.size(); xTotal = total;
+            }
+
+            /* import step 2: copy the chosen videos into the app, then remove each from the folder (a move) */
+            private static void doImportRun(List<String[]> sel) throws Exception {
+              Context c = appCtx;
+              ContentResolver cr = c.getContentResolver();
+              Uri tree = xTree;
+              File d = dir(c);
+              byte[] buf = new byte[256 * 1024];
+              for (int i = 0; i < sel.size() && !xCancel; i++) {
+                String[] k = sel.get(i);
+                xCur = k[1];
+                File tmp = new File(d, k[2] + ".imp"), fin = new File(d, k[2] + ".mp4");
+                boolean ok = false;
+                InputStream in = null; FileOutputStream out = null;
+                try {
+                  in = cr.openInputStream(DocumentsContract.buildDocumentUriUsingTree(tree, k[0]));
+                  if (in == null) throw new IOException("cannot read");
+                  out = new FileOutputStream(tmp);
+                  int r;
+                  while (!xCancel && (r = in.read(buf)) > 0) { out.write(buf, 0, r); xGot.addAndGet(r); }
+                  out.flush();
+                  out.close(); out = null;
+                  long want = Long.parseLong(k[3]);
+                  if (!xCancel && tmp.length() > 0 && (want <= 0 || tmp.length() == want)) {
+                    if (fin.exists()) fin.delete();
+                    ok = tmp.renameTo(fin);
+                  }
+                } catch (Throwable t) {
+                  ok = false;
+                } finally {
+                  try { if (in != null) in.close(); } catch (Throwable ignored) { }
+                  try { if (out != null) out.close(); } catch (Throwable ignored) { }
+                  if (!ok) { try { tmp.delete(); } catch (Throwable ignored) { } }
+                }
+                if (ok) {
+                  xDone++;
+                  try { DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, k[0])); } catch (Throwable ignored) { }
+                } else if (!xCancel) xBad++;
+              }
+              /* everything listed was moved -> the saved list in the folder is no longer needed */
+              List<String[]> all = xItems;
+              if (!xCancel && xBad == 0 && xManId != null && all != null && sel.size() == all.size()) {
+                try { DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, xManId)); } catch (Throwable ignored) { }
+              }
+                            xItems = null;
+            }
+
+            /* ================= parallel downloader ================= */
+            private class Job implements Runnable {
+              final String id, url, ref, ua;
+              volatile boolean cancelled = false;
+              volatile String st = "run";
+              volatile String label = "";
+              volatile long total = 0;
+              final AtomicLong got = new AtomicLong(0);
+              volatile long lastNote = 0;
+              void note() { long n = System.currentTimeMillis(); if (n - lastNote < 1000) return; lastNote = n; svcProgress(); }
+              final Set<HttpURLConnection> conns = Collections.newSetFromMap(new ConcurrentHashMap<HttpURLConnection, Boolean>());
+
+              Job(String id, String url, String ref, String ua) { this.id = id; this.url = url; this.ref = ref; this.ua = ua; }
+
+              void abort() {
+                cancelled = true;
+                for (HttpURLConnection c : conns) { try { c.disconnect(); } catch (Throwable ignored) { } }
+              }
+
+              HttpURLConnection open(String u0, String range) throws IOException {
+                String u = u0;
+                for (int i = 0; i < 6; i++) {
+                  HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+                  c.setConnectTimeout(12000);
+                  c.setReadTimeout(20000);
+                  c.setInstanceFollowRedirects(false);
+                  c.setRequestProperty("User-Agent", ua);
+                  if (ref != null && ref.length() > 0) c.setRequestProperty("Referer", ref);
+                  c.setRequestProperty("Accept", "*/*");
+                  c.setRequestProperty("Accept-Encoding", "identity");
+                  if (range != null) c.setRequestProperty("Range", range);
+                  conns.add(c);
+                  if (cancelled) { conns.remove(c); c.disconnect(); throw new IOException("cancelled"); }
+                  int code = c.getResponseCode();
+                  if (code >= 300 && code < 400) {
+                    String loc = c.getHeaderField("Location");
+                    conns.remove(c);
+                    c.disconnect();
+                    if (loc == null) throw new IOException("redirect without Location");
+                    u = new URL(new URL(u), loc).toString();
+                    continue;
+                  }
+                  return c;
+                }
+                throw new IOException("too many redirects");
+              }
+                            void drop(HttpURLConnection c) { if (c != null) { conns.remove(c); try { c.disconnect(); } catch (Throwable ignored) { } } }
+
+              public void run() {
+                File part = partFile(id), fin = finFile(id);
+                try {
+                  if (part.exists()) part.delete();
+                  if (fin.exists()) fin.delete();
+                  HttpURLConnection c = open(url, "bytes=0-0");
+                  int code = c.getResponseCode();
+                  String cr = c.getHeaderField("Content-Range");
+                  long cl = c.getContentLengthLong();
+                  String finalUrl = c.getURL().toString();
+                  long tot = -1;
+                  boolean ranged = false;
+                  if (code == 206 && cr != null) {
+                    int s = cr.lastIndexOf('/');
+                    if (s > 0) { try { tot = Long.parseLong(cr.substring(s + 1).trim()); ranged = tot > 0; } catch (Exception ignored) { } }
+                  } else if (code == 200) {
+                    tot = cl;
+                  } else {
+                    drop(c);
+                    throw new IOException("http " + code);
+                  }
+                  total = tot > 0 ? tot : 0;
+                  if (ranged && tot >= 2L * BLOCK) {
+                    drop(c);
+                                        try {
+                                                              parallel(finalUrl, tot, part);
+                    } catch (Throwable e) {
+                      if (cancelled) return;
+                      got.set(0);                       /* parallel failed (server dislikes many connections?) -> one plain stream */
+                      if (part.exists()) part.delete();
+                      HttpURLConnection s1 = open(finalUrl, null);
+                      if (s1.getResponseCode() != 200) { int cc = s1.getResponseCode(); drop(s1); throw new IOException("http " + cc); }
+                      single(s1, part);
+                    }
+                  } else {
+                    HttpURLConnection s1 = c;
+                    if (code == 206) { drop(c); s1 = open(finalUrl, null); }
+                    if (s1.getResponseCode() != 200) { int cc = s1.getResponseCode(); drop(s1); throw new IOException("http " + cc); }
+                    single(s1, part);
+                  }
+                  if (cancelled) return;
+                  long len = part.length();
+                  if (total > 0 && got.get() != total) throw new IOException("incomplete " + got.get() + "/" + total);
+                  if (len <= 0) throw new IOException("empty file");
+                  if (fin.exists()) fin.delete();
+                  if (!part.renameTo(fin)) throw new IOException("rename failed");
+                  total = len;
+                  got.set(len);
+                  st = "ok";
+                  jobs.remove(id, this);
+                  DownloadService.done(ctx, label);
+                } catch (Throwable t) {
+                  if (!cancelled) st = "fail";
+                  try { if (part.exists()) part.delete(); } catch (Throwable ignored) { }
+                } finally {
+                  svcCheck();
+                }
+              }
+
+              void single(HttpURLConnection c, File part) throws IOException {
+                long cl = c.getContentLengthLong();
+                total = cl > 0 ? cl : 0;
+                got.set(0);
+                try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(part)) {
+                  byte[] b = new byte[64 * 1024];
+                  int r;
+                  while (!cancelled && (r = in.read(b)) > 0) { out.write(b, 0, r); got.addAndGet(r); note(); }
+                } finally { drop(c); }
+              }
+
+              void parallel(final String u, final long tot, File part) throws Throwable {
+                RandomAccessFile raf = new RandomAccessFile(part, "rw");
+                try {
+                  raf.setLength(tot);
+                  final FileChannel ch = raf.getChannel();
+                  final int nb = (int) ((tot + BLOCK - 1) / BLOCK);
+                  final AtomicInteger next = new AtomicInteger(0);
+                  final AtomicReference<Throwable> fail = new AtomicReference<>(null);
+                  int n = Math.min(CONNS, nb);
+                  Thread[] ts = new Thread[n];
+                  for (int i = 0; i < n; i++) {
+                    ts[i] = new Thread(new Runnable() {
+                      public void run() {
+                        byte[] buf = new byte[64 * 1024];
+                        while (!cancelled && fail.get() == null) {
+                          int b = next.getAndIncrement();
+                          if (b >= nb) break;
+                          long a = (long) b * BLOCK;
+                          long z = Math.min(tot - 1, a + BLOCK - 1);
+                          boolean ok = false;
+                          Throwable last = null;
+                          for (int t = 0; t < 4 && !ok && !cancelled; t++) {
+                            long pos = a;
+                            HttpURLConnection c = null;
+                            try {
+                              c = open(u, "bytes=" + a + "-" + z);
+                              if (c.getResponseCode() != 206) throw new IOException("range http " + c.getResponseCode());
+                              InputStream in = c.getInputStream();
+                              int r;
+                              while (pos <= z && (r = in.read(buf, 0, (int) Math.min(buf.length, z - pos + 1))) > 0) {
+                                ByteBuffer bb = ByteBuffer.wrap(buf, 0, r);
+                                long p = pos;
+                                while (bb.hasRemaining()) p += ch.write(bb, p);
+                                pos += r;
+                                got.addAndGet(r);
+                                note();
+                              }
+                              if (pos <= z) throw new IOException("short block");
+                              ok = true;
+                            } catch (Throwable e) {
+                              last = e;
+                              got.addAndGet(-(pos - a));
+                              try { Thread.sleep(400L * (t + 1)); } catch (InterruptedException ie) { return; }
+                            } finally {
+                              drop(c);
+                            }
+                          }
+                          if (!ok && !cancelled) fail.compareAndSet(null, last != null ? last : new IOException("block failed"));
+                        }
+                      }
+                    }, "animedl-" + id + "-" + i);
+                    ts[i].setDaemon(true);
+                    ts[i].start();
+                  }
+                  for (Thread t : ts) { try { t.join(); } catch (InterruptedException ie) { cancelled = true; } }
+                  if (fail.get() != null) throw fail.get();
+                } finally {
+                  try { raf.close(); } catch (Throwable ignored) { }
+                }
+              }
+            }
+                        /* ================= local file server (Range aware) ================= */
+                                    private static synchronized void startServer(final Context c) {
+              if (srv != null) return;
+              try {
+                srv = new ServerSocket(0, 32, InetAddress.getByName("127.0.0.1"));
+                port = srv.getLocalPort();
+                byte[] rb = new byte[12];
+                new SecureRandom().nextBytes(rb);
+                StringBuilder sb = new StringBuilder();
+                for (byte x : rb) sb.append(String.format("%02x", x));
+                token = sb.toString();
+                Thread t = new Thread(new Runnable() {
+                  public void run() {
+                    while (true) {
+                      try {
+                        final Socket s = srv.accept();
+                        POOL.execute(new Runnable() { public void run() { handle(c, s); } });
+                      } catch (IOException e) {
+                        if (srv == null || srv.isClosed()) break;
+                      }
+                    }
+                  }
+                }, "animedl-srv");
+                t.setDaemon(true);
+                t.start();
+              } catch (Throwable e) {
+                srv = null;
+                port = 0;
+              }
+            }
+
+                                    private static void status(OutputStream o, int code, String msg, String extra) throws IOException {
+              String h = "HTTP/1.1 " + code + " " + msg + "\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n" + (extra == null ? "" : extra) + "\r\n";
+              o.write(h.getBytes("ISO-8859-1"));
+              o.flush();
+            }
+
+            private static void handle(Context c, Socket s) {
+              try {
+                s.setSoTimeout(15000);
+                BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "ISO-8859-1"));
+                String line = r.readLine();
+                if (line == null) return;
+                String[] rl = line.split(" ");
+                String method = rl.length > 0 ? rl[0] : "";
+                String path = rl.length > 1 ? rl[1] : "";
+                String range = null, h;
+                                while ((h = r.readLine()) != null && h.length() > 0) {
+                  if (h.regionMatches(true, 0, "range:", 0, 6)) range = h.substring(6).trim();
+                }
+                OutputStream o = s.getOutputStream();
+                final String rawPath = path;
+                int q = path.indexOf('?');
+                if (q >= 0) path = path.substring(0, q);
+                String pre = "/" + token + "/";
+                if (!path.startsWith(pre) || !(method.equals("GET") || method.equals("HEAD"))) { status(o, 404, "Not Found", null); return; }
+                if (path.equals(pre + "ag")) { handleAg(s, o, Uri.parse("http://127.0.0.1" + rawPath), range, method); return; }
+                String name = safe(path.substring(pre.length()).replaceAll("\\.mp4$", ""));
+                File f = new File(dir(c), name + ".mp4");
+                if (!f.exists()) { status(o, 404, "Not Found", null); return; }
+                long len = f.length(), start = 0, end = len - 1;
+                boolean partial = false;
+                if (range != null && range.startsWith("bytes=")) {
+                  String spec = range.substring(6).split(",")[0].trim();
+                  int d = spec.indexOf('-');
+                  try {
+                    String a = d > 0 ? spec.substring(0, d) : "";
+                    String b = d >= 0 ? spec.substring(d + 1) : "";
+                    if (a.length() > 0) {
+                      start = Long.parseLong(a);
+                      if (b.length() > 0) end = Long.parseLong(b);
+                    } else if (b.length() > 0) {
+                      start = Math.max(0, len - Long.parseLong(b));
+                    }
+                    partial = true;
+                  } catch (NumberFormatException ignored) { start = 0; end = len - 1; partial = false; }
+                  if (end >= len) end = len - 1;
+                  if (partial && start > end) { status(o, 416, "Range Not Satisfiable", "Content-Range: bytes */" + len + "\r\n"); return; }
+                }
+                long n = end - start + 1;
+                StringBuilder hd = new StringBuilder();
+                hd.append(partial ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n");
+                hd.append("Content-Type: video/mp4\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n");
+                hd.append("Content-Length: ").append(n).append("\r\n");
+                if (partial) hd.append("Content-Range: bytes ").append(start).append("-").append(end).append("/").append(len).append("\r\n");
+                hd.append("\r\n");
+                o.write(hd.toString().getBytes("ISO-8859-1"));
+                if (method.equals("GET")) {
+                  RandomAccessFile raf = new RandomAccessFile(f, "r");
+                  try {
+                    raf.seek(start);
+                    byte[] buf = new byte[64 * 1024];
+                    long left = n;
+                    while (left > 0) {
+                      int rd = raf.read(buf, 0, (int) Math.min(buf.length, left));
+                      if (rd <= 0) break;
+                      o.write(buf, 0, rd);
+                      left -= rd;
+                    }
+                  } finally { raf.close(); }
+                }
+                o.flush();
+              } catch (Throwable ignored) {
+                            } finally {
+                try { s.close(); } catch (Throwable ignored) { }
+              }
+            }
+
+
+            /* ================= AnimeGG stream proxy (local socket; replaces the WebView-intercepted /__ag) =================
+               Why a socket server instead of shouldInterceptRequest:
+               - the moment the player closes / abandons a request (every jump does this) the socket closes, a watcher thread sees it
+                 and cuts the upstream connection at once (the old code only noticed when Chromium got round to calling close())
+               - at most 2 live streams per file: a new request cuts the oldest one, so old requests can never pile up and starve
+                 the CDN connection limit
+               - no 90 s "abandoned" timer: while the player is paused the stream simply waits (TCP back-pressure); if the upstream
+                 connection dies meanwhile, the next read reconnects from the exact byte where it stopped (no hang, no end marker bug)
+               - direct CDN first (short timeouts), CF relay as automatic fallback, both resumable mid-stream */
+            private static final ConcurrentHashMap<String, String> AG_FINAL = new ConcurrentHashMap<>();
+            private static final ConcurrentHashMap<String, Long> AG_BAD = new ConcurrentHashMap<>();
+            private static final ConcurrentHashMap<String, Integer> AG_FAILS = new ConcurrentHashMap<>();
+            /* like the relay Worker: never ask the CDN for an open-ended range; first slice small (fast start / fast seek), then 2 MB slices */
+            private static final long AG_FIRST = 1024L * 1024L;
+            private static final long AG_CHUNK = 2L * 1024L * 1024L;
+            private static final ConcurrentHashMap<String, List<AgStream>> AG_ACTIVE = new ConcurrentHashMap<>();
+
+            private static class AgStream {
+              volatile boolean closed = false;
+              volatile HttpURLConnection live = null;
+              void cut() {
+                closed = true;
+                HttpURLConnection c = live;
+                live = null;
+                if (c != null) { try { c.disconnect(); } catch (Throwable ignored) { } }
+              }
+            }
+
+            /* new APK marker: the page only uses the socket route when this exists */
+            @JavascriptInterface public boolean ag() { return true; }
+
+            private static HttpURLConnection agTryUp(AgStream st, String url, String ref, String ua, String rng, int connMs, int readMs, boolean needPartial) {
+              try {
+                if (st.closed) return null;
+                HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(connMs);
+                c.setReadTimeout(readMs);
+                c.setInstanceFollowRedirects(true);
+                c.setRequestProperty("User-Agent", (ua != null && ua.length() > 0) ? ua : UA_DEF);
+                if (ref != null && ref.length() > 0) c.setRequestProperty("Referer", ref);
+                if (rng != null && rng.length() > 0) c.setRequestProperty("Range", rng);
+                c.setRequestProperty("Accept", "*/*");
+                c.setRequestProperty("Accept-Encoding", "identity");
+                st.live = c;
+                if (st.closed) { c.disconnect(); return null; }
+                int code = c.getResponseCode();
+                if (code == 206 || (code == 200 && !needPartial)) return c;
+                c.disconnect();
+              } catch (Throwable ignored) { }
+              return null;
+            }
+
+            private static void handleAg(Socket s, OutputStream o, Uri q, String range, String method) throws Exception {
+              final String tgt = q.getQueryParameter("u");
+              final String ref = q.getQueryParameter("r");
+              final String ua = q.getQueryParameter("ua");
+              final String fb = q.getQueryParameter("fb");
+              if (!"GET".equals(method) || tgt == null || !(tgt.startsWith("https://") || tgt.startsWith("http://"))) { status(o, 400, "Bad Request", null); return; }
+              long s0 = 0, e0 = -1;
+              boolean ranged = false;
+              if (range != null && range.startsWith("bytes=") && range.indexOf(',') < 0) {
+                String[] a = range.substring(6).trim().split("-", -1);
+                if (a.length == 2 && a[0].trim().length() > 0) {
+                  try {
+                    s0 = Long.parseLong(a[0].trim());
+                    e0 = a[1].trim().length() > 0 ? Long.parseLong(a[1].trim()) : -1;
+                    ranged = (e0 < 0 || e0 >= s0);
+                  } catch (Exception x) { ranged = false; s0 = 0; e0 = -1; }
+                }
+              }
+              final AgStream st = new AgStream();
+              List<AgStream> lst = AG_ACTIVE.get(tgt);
+              if (lst == null) {
+                lst = Collections.synchronizedList(new ArrayList<AgStream>());
+                List<AgStream> pr = AG_ACTIVE.putIfAbsent(tgt, lst);
+                if (pr != null) lst = pr;
+              }
+              synchronized (lst) {
+                while (lst.size() >= 2) lst.remove(0).cut();
+                lst.add(st);
+              }
+              try {
+                /* watcher: the player closed the socket (seek / new request / leaving) -> stop the upstream download immediately */
+                s.setSoTimeout(0);
+                final InputStream cin = s.getInputStream();
+                Thread w = new Thread(new Runnable() {
+                  public void run() {
+                    try { while (cin.read() >= 0) { } } catch (Throwable ignored) { }
+                    st.cut();
+                  }
+                }, "ag-watch");
+                w.setDaemon(true);
+                w.start();
+
+                final boolean needPart = ranged && s0 > 0;
+                String host = "";
+                try { host = Uri.parse(tgt).getHost(); if (host == null) host = ""; } catch (Throwable ig) { }
+                long cap0 = ranged ? (e0 >= 0 ? Math.min(e0, s0 + AG_FIRST - 1) : (s0 + AG_FIRST - 1)) : -1;
+              String rng0 = ranged ? ("bytes=" + s0 + "-" + cap0) : null;
+                HttpURLConnection c = null;
+                boolean viaRelay = false;
+                Long bad = AG_BAD.get(host);
+                if (bad == null || System.currentTimeMillis() > bad) {
+                  String cached = AG_FINAL.get(tgt);
+                  if (cached != null) {
+                    c = agTryUp(st, cached, ref, ua, rng0, 3500, 6000, needPart);
+                    if (c == null) AG_FINAL.remove(tgt);
+                  }
+                  if (c == null && !st.closed) c = agTryUp(st, tgt, ref, ua, rng0, 3500, 6000, needPart);
+                  if (c == null) {
+                    if (!st.closed) {
+                      Integer f0 = AG_FAILS.get(host);
+                      int nf = (f0 == null ? 0 : f0) + 1;
+                      AG_FAILS.put(host, nf);
+                      if (nf >= 2) AG_BAD.put(host, System.currentTimeMillis() + 30000L);
+                    }
+                  } else { AG_BAD.remove(host); AG_FAILS.remove(host); }
+                }
+                if (c == null && !st.closed && fb != null && fb.length() > 0) {
+                  c = agTryUp(st, fb, null, null, rng0, 8000, 12000, needPart);
+                  viaRelay = (c != null);
+                }
+                if (c == null) { if (!st.closed) status(o, 502, "Bad Gateway", null); return; }
+
+                String base = viaRelay ? fb : tgt;
+                if (!viaRelay) {
+                  try {
+                    String fin = c.getURL().toString();
+                    if (fin != null && fin.startsWith("http")) {
+                      base = fin;
+                      if (!fin.equals(tgt)) { if (AG_FINAL.size() > 64) AG_FINAL.clear(); AG_FINAL.put(tgt, fin); }
+                    }
+                  } catch (Throwable ig) { }
+                }
+                int code = c.getResponseCode();
+                String cr = c.getHeaderField("Content-Range");
+                long total = -1;
+                if (code == 206 && cr != null) {
+                  int sl = cr.lastIndexOf('/');
+                  if (sl > 0) { try { total = Long.parseLong(cr.substring(sl + 1).trim()); } catch (Exception ignored) { } }
+                } else if (code == 200) {
+                  total = c.getContentLengthLong();
+                }
+                String ct = c.getContentType();
+                String mime = "video/mp4";
+                if (ct != null) { String m = ct.split(";")[0].trim(); if (m.startsWith("video/")) mime = m; }
+                String common = "Content-Type: " + mime + "\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n";
+                byte[] buf = new byte[64 * 1024];
+
+                if (code == 206 && total > 0) {
+                  if (s0 >= total) { c.disconnect(); status(o, 416, "Range Not Satisfiable", "Content-Range: bytes */" + total + "\r\n"); return; }
+                  long end = (e0 >= 0) ? Math.min(e0, total - 1) : (total - 1);
+                  o.write(("HTTP/1.1 206 Partial Content\r\n" + common + "Content-Length: " + (end - s0 + 1) + "\r\nContent-Range: bytes " + s0 + "-" + end + "/" + total + "\r\n\r\n").getBytes("ISO-8859-1"));
+                  o.flush();
+                  long pos = s0;
+                  int fails = 0;
+                  while (pos <= end && !st.closed) {
+                    long before = pos;
+                    InputStream in = null;
+                    try { in = c.getInputStream(); } catch (IOException ex) { in = null; }
+                    if (in != null) {
+                      while (pos <= end) {
+                        int r;
+                        try { r = in.read(buf, 0, (int) Math.min(buf.length, end - pos + 1)); } catch (IOException ex) { break; }
+                        if (r <= 0) break;
+                        o.write(buf, 0, r);          /* throws when the player is gone -> whole request ends, finally{} cleans up */
+                        pos += r;
+                      }
+                      try { in.close(); } catch (Throwable ignored) { }
+                    }
+                    if (pos > end || st.closed) break;
+                    if (pos == before) { if (++fails > 2) break; } else fails = 0;
+                    /* this upstream connection ended early / died / hit the relay's slice limit: carry on from the exact byte */
+                    try { c.disconnect(); } catch (Throwable ignored) { }
+                    String nr = "bytes=" + pos + "-" + Math.min(end, pos + AG_CHUNK - 1);
+                    c = viaRelay ? agTryUp(st, base, null, null, nr, 8000, 12000, true) : agTryUp(st, base, ref, ua, nr, 3500, 8000, true);
+                    if (c == null && !viaRelay && !st.closed && fb != null && fb.length() > 0) {
+                      c = agTryUp(st, fb, null, null, nr, 8000, 12000, true);
+                      if (c != null) { viaRelay = true; base = fb; }
+                    }
+                    if (c == null) break;
+                  }
+                } else {
+                  /* no range support upstream (or an unranged request): single stream */
+                  String cl = c.getHeaderField("Content-Length");
+                  StringBuilder hd = new StringBuilder("HTTP/1.1 " + (code == 206 ? "206 Partial Content" : "200 OK") + "\r\n" + common);
+                  if (cl != null) hd.append("Content-Length: ").append(cl).append("\r\n");
+                  if (cr != null) hd.append("Content-Range: ").append(cr).append("\r\n");
+                  hd.append("\r\n");
+                  o.write(hd.toString().getBytes("ISO-8859-1"));
+                  o.flush();
+                  InputStream in = c.getInputStream();
+                  int r;
+                  while (!st.closed && (r = in.read(buf)) > 0) o.write(buf, 0, r);
+                }
+                o.flush();
+              } finally {
+                st.cut();
+                try { synchronized (lst) { lst.remove(st); } } catch (Throwable ignored) { }
+              }
+            }
+
+            /* kept for MainActivity (fallback path through WebView interception; the local server above is the main path) */
+                        public static WebResourceResponse serve(Context c, WebResourceRequest req) {
+              try {
+                Uri u = req.getUrl();
+                String p = u.getPath();
+                if (p == null || !p.startsWith("/__dl/")) return null;
+                String name = safe(p.substring(6).replaceAll("\\.mp4$", ""));
+                File f = new File(dir(c), name + ".mp4");
+                Map<String, String> h = new HashMap<>();
+                h.put("Access-Control-Allow-Origin", "*");
+                h.put("Accept-Ranges", "bytes");
+                if (!f.exists()) return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", h, new java.io.ByteArrayInputStream(new byte[0]));
+                long len = f.length(), start = 0, end = len - 1;
+                String range = req.getRequestHeaders().get("Range");
+                if (range == null) range = req.getRequestHeaders().get("range");
+                boolean partial = false;
+                if (range != null && range.startsWith("bytes=")) {
+                  String[] a = range.substring(6).split("-", 2);
+                  try {
+                    if (a[0].length() > 0) start = Long.parseLong(a[0]);
+                    if (a.length > 1 && a[1].length() > 0) end = Long.parseLong(a[1]);
+                  } catch (NumberFormatException ignored) { }
+                  if (end >= len) end = len - 1;
+                  if (start > end) start = 0;
+                  partial = true;
+                }
+                long n = end - start + 1;
+                FileInputStream fis = new FileInputStream(f);
+                long skipped = 0;
+                while (skipped < start) { long sk = fis.skip(start - skipped); if (sk <= 0) break; skipped += sk; }
+                h.put("Content-Length", String.valueOf(n));
+                if (partial) {
+                  h.put("Content-Range", "bytes " + start + "-" + end + "/" + len);
+                  return new WebResourceResponse("video/mp4", null, 206, "Partial Content", h, new Limited(fis, n));
+                }
+                return new WebResourceResponse("video/mp4", null, 200, "OK", h, new Limited(fis, n));
+              } catch (Throwable t) {
+                return null;
+              }
+            }
+
+            private static class Limited extends InputStream {
+              private final InputStream in;
+              private long left;
+              Limited(InputStream in, long n) { this.in = in; this.left = n; }
+              @Override public int read() throws IOException { if (left <= 0) return -1; int b = in.read(); if (b >= 0) left--; return b; }
+              @Override public int read(byte[] b, int o, int l) throws IOException {
+                if (left <= 0) return -1;
+                int r = in.read(b, o, (int) Math.min(l, left));
+                if (r > 0) left -= r;
+                return r;
+              }
+              @Override public void close() throws IOException { in.close(); }
+            }
+          }
+          JEOF
+          echo "package $PKG;" > "$DIR/DownloadService.java"
+          cat >> "$DIR/DownloadService.java" <<'SEOF'
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+          import androidx.core.app.NotificationCompat;
+          import androidx.core.content.ContextCompat;
+
+          /* Foreground service: keeps the process (and the downloads inside it) alive while the app is in the background */
+          public class DownloadService extends Service {
+            static final String CH = "animedl";
+            static final int ID = 4711;
+            private static volatile boolean running = false;
+            private PowerManager.WakeLock wl;
+                        static void channel(Context c) {
+              if (Build.VERSION.SDK_INT >= 26) {
+                NotificationManager m = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                if (m != null && m.getNotificationChannel(CH) == null) {
+                  m.createNotificationChannel(new NotificationChannel(CH, "Downloads", NotificationManager.IMPORTANCE_LOW));
+                }
+              }
+            }
+
+            static Notification build(Context c, int n, int pct) {
+              NotificationCompat.Builder b = new NotificationCompat.Builder(c, CH)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentTitle("Downloading episodes")
+                                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW);
+              String what = n > 1 ? (n + " downloads") : "1 download";
+              if (pct >= 0) b.setContentText(what + " - " + pct + "%").setProgress(100, pct, false);
+              else b.setContentText(what).setProgress(0, 0, true);
+              Intent li = c.getPackageManager().getLaunchIntentForPackage(c.getPackageName());
+              if (li != null) b.setContentIntent(PendingIntent.getActivity(c, 0, li, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
+              return b.build();
+            }
+
+            public static void begin(Context c) {
+              try {
+                channel(c);
+                ContextCompat.startForegroundService(c, new Intent(c, DownloadService.class));
+              } catch (Throwable ignored) { }
+            }
+                        public static void progress(Context c, int n, int pct) {
+              try {
+                if (!running) return;
+                NotificationManager m = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                if (m != null) m.notify(ID, build(c, n, pct));
+              } catch (Throwable ignored) { }
+            }
+
+            /* "Download finished" alert: posted natively, so it shows even when the app is closed */
+            public static void done(Context c, String label) {
+              try {
+                NotificationManager m = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                if (m == null) return;
+                if (Build.VERSION.SDK_INT >= 26 && m.getNotificationChannel("animedone") == null) {
+                  m.createNotificationChannel(new NotificationChannel("animedone", "Download finished", NotificationManager.IMPORTANCE_HIGH));
+                }
+                NotificationCompat.Builder b = new NotificationCompat.Builder(c, "animedone")
+                  .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                  .setContentTitle("Download finished")
+                  .setContentText((label != null && label.length() > 0) ? label : "Your episode is ready to watch")
+                  .setAutoCancel(true)
+                  .setPriority(NotificationCompat.PRIORITY_HIGH);
+                Intent li = c.getPackageManager().getLaunchIntentForPackage(c.getPackageName());
+                if (li != null) b.setContentIntent(PendingIntent.getActivity(c, 1, li, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
+                m.notify(5000 + (int) (System.currentTimeMillis() % 100000), b.build());
+              } catch (Throwable ignored) { }
+            }
+
+            public static void end(Context c) {
+              try { c.stopService(new Intent(c, DownloadService.class)); } catch (Throwable ignored) { }
+            }
+
+            @Override
+            public int onStartCommand(Intent intent, int flags, int startId) {
+              channel(this);
+              Notification n = build(this, 1, -1);
+              try {
+                if (Build.VERSION.SDK_INT >= 29) startForeground(ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                else startForeground(ID, n);
+              } catch (Throwable t) {
+                stopSelf();
+                return START_NOT_STICKY;
+              }
+              running = true;
+              try {
+                if (wl == null) {
+                  PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                  wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "animeshelf:download");
+                  wl.acquire(6L * 60 * 60 * 1000);
+                }
+              } catch (Throwable ignored) { }
+              return START_NOT_STICKY;
+            }
+
+                                    @Override
+            public void onDestroy() {
+              running = false;
+              try { if (wl != null && wl.isHeld()) wl.release(); } catch (Throwable ignored) { }
+              wl = null;
+              try { stopForeground(true); } catch (Throwable ignored) { }
+              super.onDestroy();
+            }
+
+            @Override
+            public IBinder onBind(Intent intent) { return null; }
+          }
+          SEOF
+      - name: Native activity (edge-to-edge, real fullscreen + rotation)
+        run: |
+          PKG=$(node -p "require('./capacitor.config.json').appId")
+          MAIN=$(find android/app/src/main/java -name MainActivity.java | head -1)
+          echo "package $PKG;" > "$MAIN"
+          cat >> "$MAIN" <<'EOF'
+
+          import android.content.pm.ActivityInfo;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebView;
+          import android.widget.FrameLayout;
+          import androidx.activity.OnBackPressedCallback;
+          import androidx.core.graphics.Insets;
+          import androidx.core.view.ViewCompat;
+          import androidx.core.view.WindowCompat;
+          import androidx.core.view.WindowInsetsCompat;
+          import androidx.core.view.WindowInsetsControllerCompat;
+          import com.getcapacitor.BridgeActivity;
+          import com.getcapacitor.BridgeWebChromeClient;
+          import com.getcapacitor.BridgeWebViewClient;
+          import java.io.IOException;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+                    import java.util.HashMap;
+          import java.util.Map;
+          import java.util.concurrent.ConcurrentHashMap;
+
+          public class MainActivity extends BridgeActivity {
+            private View customView;
+            private WebChromeClient.CustomViewCallback customCb;
+            private int saTop = 0, saBottom = 0;
+            private OnBackPressedCallback fsBack;
+
+            private static final ConcurrentHashMap<String, Long> AG_BAD = new ConcurrentHashMap<>();
+            private static final ConcurrentHashMap<String, Integer> AG_FAILS = new ConcurrentHashMap<>();
+
+            /* ===== AnimeGG proxy: fast start, fast seek, read-ahead =====
+               - every request is answered from CHUNKED upstream Range requests: the first chunk is small (about 3 s of
+                 video) and streamed live, so playback / a seek starts as soon as its first bytes arrive;
+               - the following chunks are read in full (so the connection goes back to the keep-alive pool and the next
+                 seek reuses it instead of paying a new TCP+TLS handshake) and queued ahead of the player (8 MB max);
+               - the redirect target of a CDN link is remembered, so seeks skip the redirect hop. */
+            private static final int AG_FIRST = 1024 * 1024;
+            private static final int AG_CHUNK = 2 * 1024 * 1024;
+            private static final int AG_PIECE = 64 * 1024;
+            private static final ConcurrentHashMap<String, String> AG_FINAL = new ConcurrentHashMap<>();
+
+            private interface AgFeed { void feed(ReadAhead ra) throws Exception; }
+
+            private static class ReadAhead extends java.io.InputStream {
+              private static final byte[] END = new byte[0];
+              private final java.util.concurrent.LinkedBlockingQueue<byte[]> q;
+              volatile HttpURLConnection live;
+              private volatile boolean closed = false;
+              private volatile IOException err = null;
+              private volatile long lastRead = System.currentTimeMillis();
+              private byte[] cur = null;
+              private int pos = 0;
+              private boolean done = false;
+
+              ReadAhead(final AgFeed feed, int maxPieces) {
+                q = new java.util.concurrent.LinkedBlockingQueue<>(maxPieces);
+                Thread t = new Thread(new Runnable() {
+                  @Override
+                  public void run() {
+                    try {
+                      feed.feed(ReadAhead.this);
+                    } catch (Throwable e) {
+                      if (!closed) err = (e instanceof IOException) ? (IOException) e : new IOException(String.valueOf(e));
+                    }
+                    try {
+                      while (!closed && !q.offer(END, 250, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                        if (System.currentTimeMillis() - lastRead > 90000L) closed = true;
+                      }
+                    } catch (Throwable ignored) { }
+                                        if (closed) { cut(); q.clear(); }
+                  }
+                }, "ag-feed");
+                t.setDaemon(true);
+                t.start();
+              }
+
+              boolean isClosed() { return closed; }
+                            /* false = the player closed the stream (seek / new request) or abandoned it for 90 s */
+              boolean push(byte[] d) {
+                try {
+                  while (!closed) {
+                    if (q.offer(d, 250, java.util.concurrent.TimeUnit.MILLISECONDS)) return true;
+                    if (System.currentTimeMillis() - lastRead > 90000L) closed = true;
+                  }
+                } catch (InterruptedException ie) { closed = true; }
+                return false;
+              }
+
+              void cut() {
+                HttpURLConnection c = live;
+                live = null;
+                if (c != null) { try { c.disconnect(); } catch (Throwable ignored) { } }
+              }
+
+              @Override
+              public int read() throws IOException {
+                byte[] one = new byte[1];
+                int n = read(one, 0, 1);
+                return n < 0 ? -1 : (one[0] & 0xff);
+              }
+
+              @Override
+              public int read(byte[] b, int off, int len) throws IOException {
+                if (len == 0) return 0;
+                lastRead = System.currentTimeMillis();
+                if (cur == null) {
+                  if (done) return -1;
+                  byte[] nx;
+                  try { nx = q.poll(30, java.util.concurrent.TimeUnit.SECONDS); } catch (InterruptedException e) { throw new IOException("interrupted"); }
+                  if (nx == null) throw new IOException("read-ahead timeout");
+                  if (nx == END) { done = true; if (err != null) throw err; return -1; }
+                  cur = nx;
+                  pos = 0;
+                }
+                int k = Math.min(len, cur.length - pos);
+                System.arraycopy(cur, pos, b, off, k);
+                pos += k;
+                if (pos >= cur.length) cur = null;
+                return k;
+              }
+
+              @Override
+              public int available() { return cur == null ? 0 : cur.length - pos; }
+
+              @Override
+              public void close() {
+                closed = true;
+                q.clear();
+                q.offer(END);
+                cut();
+              }
+            }
+
+            private static HttpURLConnection agConn(String url, String ref, String ua, String rng, int connectMs) throws IOException {
+              HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+              c.setConnectTimeout(connectMs);
+              c.setReadTimeout(10000);
+              c.setInstanceFollowRedirects(true);
+              c.setRequestProperty("User-Agent", (ua != null && ua.length() > 0) ? ua : "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36");
+              if (ref != null && ref.length() > 0) c.setRequestProperty("Referer", ref);
+              if (rng != null && rng.length() > 0) c.setRequestProperty("Range", rng);
+              c.setRequestProperty("Accept", "*/*");
+              c.setRequestProperty("Accept-Encoding", "identity");
+              return c;
+            }
+
+            private static HttpURLConnection agTry(String url, String ref, String ua, String rng, int connectMs) {
+              try {
+                HttpURLConnection c = agConn(url, ref, ua, rng, connectMs);
+                int code = c.getResponseCode();
+                if (code == 200 || code == 206) return c;
+                c.disconnect();
+              } catch (Exception ignored) { }
+              return null;
+            }
+
+            /* upstream does not do ranges: pass the single stream through (still read ahead) */
+            private static AgFeed agPassFeed(final HttpURLConnection c) {
+              return new AgFeed() {
+                @Override
+                public void feed(ReadAhead ra) throws Exception {
+                  ra.live = c;
+                  java.io.InputStream in = c.getInputStream();
+                  byte[] b = new byte[AG_PIECE];
+                  int n;
+                  while (!ra.isClosed() && (n = in.read(b)) >= 0) {
+                    if (n == 0) continue;
+                    if (!ra.push(java.util.Arrays.copyOf(b, n))) return;
+                  }
+                }
+              };
+            }
+
+            private static AgFeed agChunkFeed(final HttpURLConnection first, final String base, final String ref, final String ua,
+                                              final long s, final long end, final int connectMs) {
+              return new AgFeed() {
+                @Override
+                public void feed(ReadAhead ra) throws Exception {
+                  long pos = s;
+                  HttpURLConnection c = first;
+                  boolean firstChunk = true;
+                  int fails = 0;
+                  while (pos <= end && !ra.isClosed()) {
+                    if (c == null) {
+                      long to = Math.min(end, pos + AG_CHUNK - 1);
+                      try {
+                        c = agConn(base, ref, ua, "bytes=" + pos + "-" + to, connectMs);
+                        ra.live = c;
+                        int code = c.getResponseCode();
+                        if (code != 206) throw new IOException("chunk http " + code);
+                      } catch (IOException e) {
+                        try { if (c != null) c.disconnect(); } catch (Throwable ignored) { }
+                        c = null;
+                        ra.live = null;
+                        if (ra.isClosed() || ++fails > 2) throw e;
+                        continue;
+                      }
+                    }
+                    ra.live = c;
+                    java.io.InputStream in = c.getInputStream();
+                    long before = pos;
+                    byte[] b = new byte[AG_PIECE];
+                    int n;
+                    if (firstChunk) {
+                      /* streamed live: playback starts as soon as the first bytes arrive */
+                      while (!ra.isClosed() && (n = in.read(b)) >= 0) {
+                        if (n == 0) continue;
+                        if (!ra.push(java.util.Arrays.copyOf(b, n))) return;
+                        pos += n;
+                      }
+                    } else {
+                      /* read in full first, so the connection returns to the pool before the data is handed over */
+                      java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream(AG_CHUNK);
+                      while (!ra.isClosed() && (n = in.read(b)) >= 0) bo.write(b, 0, n);
+                      if (ra.isClosed()) return;
+                      try { in.close(); } catch (Throwable ignored) { }
+                      ra.live = null;
+                      byte[] all = bo.toByteArray();
+                      for (int o = 0; o < all.length; o += AG_PIECE) {
+                        if (!ra.push(java.util.Arrays.copyOfRange(all, o, Math.min(all.length, o + AG_PIECE)))) return;
+                      }
+                      pos += all.length;
+                    }
+                    try { in.close(); } catch (Throwable ignored) { }
+                    ra.live = null;
+                    c = null;
+                                        firstChunk = false;
+                    if (pos == before && ++fails > 2) throw new IOException("empty chunk");
+                  }
+                }
+              };
+            }
+
+            private WebResourceResponse agOpen(String target, String ref, String ua, String range, int connectMs) {
+              try {
+                if (target == null || !(target.startsWith("https://") || target.startsWith("http://"))) return null;
+                long s = 0, e = -1;
+                boolean ranged = false;
+                if (range != null && range.startsWith("bytes=") && range.indexOf(',') < 0) {
+                  String[] a = range.substring(6).trim().split("-", -1);
+                  if (a.length == 2 && a[0].trim().length() > 0) {
+                    try {
+                      s = Long.parseLong(a[0].trim());
+                      e = a[1].trim().length() > 0 ? Long.parseLong(a[1].trim()) : -1;
+                      ranged = (e < 0 || e >= s);
+                    } catch (Exception x) { ranged = false; }
+                  }
+                }
+                long firstTo = (e >= 0) ? Math.min(e, s + AG_FIRST - 1) : (s + AG_FIRST - 1);
+                String rng = ranged ? ("bytes=" + s + "-" + firstTo) : range;
+                HttpURLConnection c = null;
+                String cached = AG_FINAL.get(target);
+                if (cached != null) {
+                                  c = agTry(cached, ref, ua, rng, connectMs);
+                  if (c == null) AG_FINAL.remove(target);
+                }
+                                if (c == null) c = agTry(target, ref, ua, rng, connectMs);
+                if (c == null) return null;
+                int code = c.getResponseCode();
+                String base = target;
+                try {
+                  String fin = c.getURL().toString();
+                  if (fin != null && fin.startsWith("http")) {
+                    base = fin;
+                    if (!fin.equals(target)) { if (AG_FINAL.size() > 64) AG_FINAL.clear(); AG_FINAL.put(target, fin); }
+                  }
+                } catch (Throwable ignored) { }
+                String ct = c.getContentType();
+                String mime = "video/mp4";
+                if (ct != null) { String m = ct.split(";")[0].trim(); if (m.startsWith("video/")) mime = m; }
+                Map<String, String> h = new HashMap<>();
+                h.put("Accept-Ranges", "bytes");
+                h.put("Access-Control-Allow-Origin", "*");
+                long total = -1;
+                String cr = c.getHeaderField("Content-Range");
+                if (code == 206 && cr != null) {
+                  int sl = cr.lastIndexOf('/');
+                  if (sl > 0) { try { total = Long.parseLong(cr.substring(sl + 1).trim()); } catch (Exception ignored) { } }
+                }
+                if (ranged && code == 206 && total > 0 && s < total) {
+                  long end = (e >= 0) ? Math.min(e, total - 1) : (total - 1);
+                  h.put("Content-Length", String.valueOf(end - s + 1));
+                  h.put("Content-Range", "bytes " + s + "-" + end + "/" + total);
+                  ReadAhead ra = new ReadAhead(agChunkFeed(c, base, ref, ua, s, end, connectMs), 128);
+                  return new WebResourceResponse(mime, null, 206, "Partial Content", h, ra);
+                }
+                if (ranged && code == 200 && s > 0) { c.disconnect(); return null; }
+                /* no range support (or an unranged request): single stream, still read ahead */
+                String cl = c.getHeaderField("Content-Length");
+                if (cl != null) h.put("Content-Length", cl);
+                if (cr != null) h.put("Content-Range", cr);
+                return new WebResourceResponse(mime, null, code, code == 206 ? "Partial Content" : "OK", h, new ReadAhead(agPassFeed(c), 128));
+              } catch (Exception ex) {
+                return null;
+              }
+            }
+
+            private WebResourceResponse agProxy(WebResourceRequest rq) {
+              Uri u = rq.getUrl();
+              String range = null;
+              Map<String, String> rh = rq.getRequestHeaders();
+              if (rh != null) for (Map.Entry<String, String> e : rh.entrySet()) if ("range".equalsIgnoreCase(e.getKey())) range = e.getValue();
+              String tgt = u.getQueryParameter("u");
+              String host = "";
+              try { host = Uri.parse(tgt).getHost(); if (host == null) host = ""; } catch (Exception e) { }
+              Long bad = AG_BAD.get(host);
+              WebResourceResponse r = null;
+              /* direct route: short connect wait; if it fails, skip it for 30 s after two failures in a row and go straight to the relay */
+              if (bad == null || System.currentTimeMillis() > bad) {
+                r = agOpen(tgt, u.getQueryParameter("r"), u.getQueryParameter("ua"), range, 3500);
+                if (r == null) { Integer f0 = AG_FAILS.get(host); int nf = (f0 == null ? 0 : f0) + 1; AG_FAILS.put(host, nf); if (nf >= 2) AG_BAD.put(host, System.currentTimeMillis() + 30000L); } else { AG_BAD.remove(host); AG_FAILS.remove(host); }
+              }
+              if (r == null) r = agOpen(u.getQueryParameter("fb"), null, null, range, 8000);
+              if (r == null) return new WebResourceResponse("text/plain", "utf-8", 502, "Bad Gateway", new HashMap<String, String>(), new java.io.ByteArrayInputStream(new byte[0]));
+              return r;
+            }
+
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              /* folder picker for Export / Import of downloaded videos */
+              final androidx.activity.result.ActivityResultLauncher<Uri> treeLauncher = registerForActivityResult(
+                new androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree(),
+                uri -> AnimeDL.onPicked(uri));
+              AnimeDL.picker = mode -> runOnUiThread(() -> treeLauncher.launch(null));
+              if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1001);
+              }
+              final Window w = getWindow();
+              WindowCompat.setDecorFitsSystemWindows(w, false);
+              w.setStatusBarColor(Color.TRANSPARENT);
+              w.setNavigationBarColor(Color.TRANSPARENT);
+              if (Build.VERSION.SDK_INT >= 29) w.setNavigationBarContrastEnforced(false);
+              if (Build.VERSION.SDK_INT >= 28) {
+                WindowManager.LayoutParams lp = w.getAttributes();
+                lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                w.setAttributes(lp);
+              }
+              WindowInsetsControllerCompat ic = WindowCompat.getInsetsController(w, w.getDecorView());
+              ic.setAppearanceLightStatusBars(false);
+              ic.setAppearanceLightNavigationBars(false);
+
+              final WebView wv = getBridge().getWebView();
+              wv.addJavascriptInterface(new Object() {
+                @JavascriptInterface
+                public String get() { return saTop + "," + saBottom; }
+              }, "AnimeInsets");
+
+              getBridge().setWebViewClient(new BridgeWebViewClient(getBridge()) {
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                  try {
+                    Uri u = request.getUrl();
+                    if ("localhost".equals(u.getHost()) && "/__ag".equals(u.getPath())) return agProxy(request);
+                    if ("localhost".equals(u.getHost()) && u.getPath() != null && u.getPath().startsWith("/__dl/")) {
+                      WebResourceResponse dl = AnimeDL.serve(MainActivity.this, request);
+                      if (dl != null) return dl;
+                    }
+                  } catch (Exception e) { }
+                  return super.shouldInterceptRequest(view, request);
+                }
+              });
+              wv.addJavascriptInterface(new Object() {
+                @JavascriptInterface
+                public boolean ok() { return true; }
+              }, "AnimeProxy");
+              wv.addJavascriptInterface(new AnimeDL(this), "AnimeDL");
+
+              ViewCompat.setOnApplyWindowInsetsListener(w.getDecorView(), (v, insets) -> {
+                Insets b = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+                float d = getResources().getDisplayMetrics().density;
+                saTop = Math.round(b.top / d);
+                saBottom = Math.round(b.bottom / d);
+                final String js = "(function(){var s=document.documentElement.style;s.setProperty('--sa-top','" + saTop + "px');s.setProperty('--sa-bottom','" + saBottom + "px')})()";
+                wv.post(() -> wv.evaluateJavascript(js, null));
+                return ViewCompat.onApplyWindowInsets(v, insets);
+              });
+
+              fsBack = new OnBackPressedCallback(false) {
+                @Override
+                public void handleOnBackPressed() { exitCustom(); }
+              };
+              getOnBackPressedDispatcher().addCallback(this, fsBack);
+
+              wv.setWebChromeClient(new BridgeWebChromeClient(getBridge()) {
+                @Override
+                public void onShowCustomView(View view, WebChromeClient.CustomViewCallback cb) {
+                  if (customView != null) { cb.onCustomViewHidden(); return; }
+                  customView = view;
+                  customCb = cb;
+                  view.setBackgroundColor(Color.BLACK);
+                              ((ViewGroup) getWindow().getDecorView()).addView(view,
+                    new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  WindowInsetsControllerCompat c = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+                  c.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                  c.hide(WindowInsetsCompat.Type.systemBars());
+                  setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+                  fsBack.setEnabled(true);
+                }
+
+                @Override
+                public void onHideCustomView() { exitCustom(); }
+              });
+            }
+
+            private void exitCustom() {
+              if (customView == null) return;
+              View v = customView;
+              WebChromeClient.CustomViewCallback cb = customCb;
+              customView = null;
+              customCb = null;
+              fsBack.setEnabled(false);
+              if (v.getParent() instanceof ViewGroup) ((ViewGroup) v.getParent()).removeView(v);
+              WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView()).show(WindowInsetsCompat.Type.systemBars());
+              setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+              if (cb != null) cb.onCustomViewHidden();
+            }
+          }
+          EOF
+      - run: npx cap sync android
+      - name: Build and sign
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -in release.keystore.enc -out release.keystore -pass env:KEY_PASS
+          cd android && ./gradlew assembleRelease && cd ..
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          $BT/zipalign -p -f 4 android/app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
+          $BT/apksigner sign --ks release.keystore --ks-pass env:KEY_PASS --ks-key-alias animeshelf --out AnimeShelf.apk aligned.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AnimeShelf-apk
+          path: AnimeShelf.apk
